@@ -1,5 +1,6 @@
 import dataclasses
 import gc
+import inspect
 import logging
 import math
 import os
@@ -306,11 +307,14 @@ def setup_model_and_optimizer(
         assert args.no_save_optim, "Stateless Adam does not save Adam moment states. Please set --no-save-optim."
 
     optimizer_context = _patch_megatron_adam(StatelessAdam) if args.use_stateless_adam else nullcontext()
+    use_gloo_process_groups = getattr(
+        args, "use_gloo_process_groups", getattr(args, "enable_gloo_process_groups", False)
+    )
     with optimizer_context:
         optimizer = get_megatron_optimizer(
             config=config,
             model_chunks=model,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
+            use_gloo_process_groups=use_gloo_process_groups,
         )
     if args.use_stateless_adam:
         _disable_distributed_optimizer_state_initialization(optimizer)
@@ -627,7 +631,7 @@ def train_one_step(
             if batch["multimodal_train_inputs"] is not None:
                 forward_kwargs.update(batch["multimodal_train_inputs"])
 
-            if args.enable_mtp_training:
+            if args.enable_mtp_training and "mtp_kwargs" in inspect.signature(model.forward).parameters:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
             output_tensor = model(**forward_kwargs)

@@ -1,5 +1,7 @@
+import os
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any
 
 import ray
@@ -242,14 +244,19 @@ def _send_to_colocated_engine(
 
     serialized_tensors = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        metadata = flattened_tensor_bucket.get_metadata()
+        with _torch_memory_saver_disabled():
+            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+            if _torch_memory_saver_preloaded() and flattened_tensor.is_cuda:
+                flattened_tensor = flattened_tensor.cpu()
+            metadata = flattened_tensor_bucket.get_metadata()
         flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "flattened_tensor": flattened_tensor,
             "metadata": metadata,
         }
-        long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+        serialized_tensors.append(_serialize_flattened_tensor_data(flattened_tensor_data))
+        if flattened_tensor.is_cuda:
+            long_live_tensors.append(flattened_tensor_data)
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -275,7 +282,7 @@ def _send_to_colocated_engine(
                 if empty_serialized_tensor is None:
                     empty_tensor_data = _empty_flattened_tensor_data()
                     long_live_tensors.append(empty_tensor_data)
-                    empty_serialized_tensor = MultiprocessingSerializer.serialize(empty_tensor_data, output_str=True)
+                    empty_serialized_tensor = _serialize_flattened_tensor_data(empty_tensor_data)
                 serialized_tensors_for_dtype.append(empty_serialized_tensor)
 
             kwargs = {
@@ -289,7 +296,62 @@ def _send_to_colocated_engine(
 
 
 def _empty_flattened_tensor_data():
-    return {
-        "flattened_tensor": torch.empty(0, dtype=torch.uint8, device=torch.cuda.current_device()),
-        "metadata": [],
-    }
+    device = "cpu" if _torch_memory_saver_preloaded() else torch.cuda.current_device()
+    with _torch_memory_saver_disabled():
+        return {
+            "flattened_tensor": torch.empty(0, dtype=torch.uint8, device=device),
+            "metadata": [],
+        }
+
+
+def _serialize_flattened_tensor_data(flattened_tensor_data):
+    tensor = flattened_tensor_data["flattened_tensor"]
+    device = getattr(tensor, "device", None)
+    if getattr(device, "type", None) == "cpu":
+        flattened_tensor_data = {
+            **flattened_tensor_data,
+            "flattened_tensor": _SerializedCpuTensor(tensor),
+        }
+
+    return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+
+
+class _SerializedCpuTensor:
+    def __init__(self, tensor: torch.Tensor):
+        tensor = tensor.contiguous()
+        self.data = tensor.numpy().tobytes()
+        self.dtype_name = str(tensor.dtype).removeprefix("torch.")
+        self.shape = tuple(tensor.shape)
+
+    def __reduce__(self):
+        return (_rebuild_cpu_tensor_from_bytes, (self.data, self.dtype_name, self.shape))
+
+
+def _rebuild_cpu_tensor_from_bytes(data: bytes, dtype_name: str, shape: tuple[int, ...]):
+    tensor = torch.frombuffer(bytearray(data), dtype=getattr(torch, dtype_name))
+    return tensor.reshape(shape)
+
+
+def _torch_memory_saver_preloaded() -> bool:
+    return os.environ.get("TMS_INIT_ENABLE") == "1"
+
+
+def _torch_memory_saver_disabled():
+    if not _torch_memory_saver_preloaded():
+        return nullcontext()
+
+    try:
+        from torch_memory_saver import torch_memory_saver
+    except ImportError:
+        return nullcontext()
+
+    impl = getattr(torch_memory_saver, "_impl", None)
+    if impl is None:
+        return nullcontext()
+    try:
+        if not impl._binary_wrapper.cdll.tms_get_interesting_region():
+            return nullcontext()
+    except Exception:
+        return nullcontext()
+
+    return torch_memory_saver.disable()

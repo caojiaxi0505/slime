@@ -110,6 +110,22 @@ def make_allgather_cp_args(**overrides):
     return types.SimpleNamespace(**values)
 
 
+def make_default_megatron_args(**overrides):
+    values = dict(
+        fp16=False,
+        seq_length=None,
+        multi_latent_attention=False,
+        vocab_size=None,
+        padded_vocab_size=None,
+        tokenizer_model=None,
+        tokenizer_type=None,
+        hf_checkpoint="/tmp/hf",
+        mtp_detach_heads=False,
+    )
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
 @pytest.mark.unit
 def test_hf_validate_all_moe_skips_dense_intermediate_size(monkeypatch):
     module = load_arguments_module(monkeypatch)
@@ -165,6 +181,16 @@ def test_allgather_cp_ignores_cp_size_one(monkeypatch):
     args = make_allgather_cp_args(context_parallel_size=1)
 
     module._validate_allgather_cp_supported(args)
+
+
+@pytest.mark.unit
+def test_default_megatron_args_force_mtp_detach_heads(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_default_megatron_args()
+
+    module._set_default_megatron_args(args)
+
+    assert args.mtp_detach_heads is True
 
 
 @pytest.mark.unit

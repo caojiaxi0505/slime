@@ -1,14 +1,19 @@
 import ast
 import logging
+import math
 
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
-from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 from transformers import AutoConfig
 
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = logging.getLogger(__name__)
+
+
+def _vocab_size_with_padding(vocab_size, args):
+    multiple = args.make_vocab_size_divisible_by * args.tensor_model_parallel_size
+    return int(math.ceil(vocab_size / multiple) * multiple)
 
 
 _ALLGATHER_CP_DSA_ARCHITECTURES = {
@@ -154,6 +159,8 @@ def _set_default_megatron_args(args):
     args.use_persistent_ckpt_worker = True
     args.ckpt_assume_constant_structure = True
     args.ckpt_fully_parallel_load = True
+    # Keep MTP auxiliary loss from updating the main model.
+    args.mtp_detach_heads = True
     # placeholders
     if args.seq_length is None:
         args.seq_length = 4096
