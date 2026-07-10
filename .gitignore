@@ -193,3 +193,6 @@ glm/
 _examples_synced/
 .env
 .DS_Store
+
+# Local git worktrees (isolated feature checkouts)
+.worktrees/
