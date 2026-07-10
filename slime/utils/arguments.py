@@ -482,6 +482,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--custom-cc-reward-function-path",
+                type=str,
+                default="examples.claudecode_ags.rewards.default.compose",
+                help="module.fn for CC reward: compose(*, base_eval, sample=None, args=None) -> (float, dict)",
+            )
+            parser.add_argument(
                 "--custom-rollout-log-function-path",
                 type=str,
                 default=None,
