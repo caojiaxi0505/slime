@@ -382,3 +382,19 @@ async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
         check=True,
         timeout=60,
     )
+
+
+def sandbox_backend_from_env(default: str = "e2b") -> str:
+    return (os.environ.get("SLIME_AGENT_SANDBOX_BACKEND") or default).strip().lower()
+
+
+def make_sandbox(image: str, *, backend: str | None = None):
+    """Construct a sandbox for ``image`` using ``backend`` or env."""
+    kind = (backend or sandbox_backend_from_env()).strip().lower()
+    if kind == "e2b":
+        return E2BSandbox(image)
+    if kind == "ags":
+        from slime.agent.sandbox_ags import AGSSandbox
+
+        return AGSSandbox(image)
+    raise ValueError(f"Unknown sandbox backend: {kind!r}")
