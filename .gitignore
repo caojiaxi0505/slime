@@ -196,3 +196,10 @@ _examples_synced/
 
 # Local git worktrees (isolated feature checkouts)
 .worktrees/
+
+# Local slime AGS config (copy from slime_ags.env.example); track templates via negation below
+examples/claudecode_ags/env/slime_ags.env
+
+# Track example env templates (global env/ ignore above would skip them)
+!examples/claudecode_ags/env/
+!examples/claudecode_ags/env/**
