@@ -4,6 +4,8 @@ End-to-end SWE coding-agent RL with **Claude Code** inside **Tencent AGS** sandb
 
 Design spec: [CC + AGS + SWE refactor design](../../docs/superpowers/specs/2026-07-10-cc-ags-swe-refactor-design.md)
 
+AGS / adapter / timeout 排障：[TROUBLESHOOTING.md](./TROUBLESHOOTING.md)
+
 ## Call chain
 
 ```text

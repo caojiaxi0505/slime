@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${DEPLOY_NAME}
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: ${APP_LABEL}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${APP_LABEL}
+  template:
+    metadata:
+      labels:
+        app: ${APP_LABEL}
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: sglang-adapter
+          image: ${IMAGE_URI}
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "${ENTRYPOINT_PATH}"]
+          env:
+            - name: HF_CHECKPOINT
+              value: "${HF_CHECKPOINT}"
+            - name: SGLANG_PORT
+              value: "${SGLANG_PORT}"
+            - name: ADAPTER_PORT
+              value: "${ADAPTER_PORT}"
+            - name: SLIME_ADAPTER_PORT
+              value: "${ADAPTER_PORT}"
+            - name: SLIME_ADAPTER_BIND_HOST
+              value: "0.0.0.0"
+            - name: TP_SIZE
+              value: "${TP_SIZE}"
+            - name: NUM_GPUS
+              value: "${NUM_GPUS}"
+            - name: SGLANG_MEM_FRACTION_STATIC
+              value: "${SGLANG_MEM_FRACTION_STATIC}"
+            - name: EXTRA_SGLANG_ARGS
+              value: "${EXTRA_SGLANG_ARGS}"
+            - name: LAUNCH_DIR
+              value: "${LAUNCH_DIR}"
+            - name: SLIME_ROOT
+              value: "${SLIME_ROOT}"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - name: adapter
+              containerPort: ${ADAPTER_PORT}
+            - name: sglang
+              containerPort: ${SGLANG_PORT}
+          resources:
+            requests:
+              cpu: "${CPU_REQUEST}"
+              memory: "${MEMORY_REQUEST}"
+              nvidia.com/gpu: "${NUM_GPUS}"
+            limits:
+              cpu: "${CPU_LIMIT}"
+              memory: "${MEMORY_LIMIT}"
+              nvidia.com/gpu: "${NUM_GPUS}"
+          volumeMounts:
+            - name: fsx-storage
+              mountPath: ${FSX_MOUNT_PATH}
+            - name: dshm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: adapter
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: adapter
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 10
+      volumes:
+        - name: fsx-storage
+          persistentVolumeClaim:
+            claimName: ${FSX_PVC_NAME}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: ${SHM_SIZE}

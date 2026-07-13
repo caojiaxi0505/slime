@@ -1,0 +1,6 @@
+# Keep EFA installer scripts in-tree for Kaniko builds; ignore junk only.
+*
+!.gitignore
+!README.md
+!install-efa-in-container.sh
+!fix-efa-conflict.sh

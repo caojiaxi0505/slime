@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app: kaniko-slime-build
+    slime.image-tag: ${IMAGE_TAG_LABEL}
+spec:
+  ttlSecondsAfterFinished: ${TTL_SECONDS_AFTER_FINISHED}
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: kaniko-slime-build
+    spec:
+      serviceAccountName: ${SERVICE_ACCOUNT}
+      restartPolicy: Never
+      ${NODE_SELECTOR_YAML}
+      containers:
+        - name: kaniko
+          image: ${KANIKO_EXECUTOR_IMAGE}
+          args:
+            - --context=dir://${BUILD_CONTEXT}
+            - --dockerfile=${DOCKERFILE}
+            - --destination=${ECR_URI}:${IMAGE_TAG}
+            - --build-arg=SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG}
+            - --build-arg=PATCH_VERSION=${PATCH_VERSION}
+            - --build-arg=ENABLE_EFA=${ENABLE_EFA}
+            - --cache=${KANIKO_CACHE}
+            - --verbosity=info
+            - --cleanup
+          env:
+            - name: AWS_REGION
+              value: ${AWS_REGION}
+            - name: AWS_DEFAULT_REGION
+              value: ${AWS_REGION}
+          resources:
+            requests:
+              cpu: "${CPU_REQUEST}"
+              memory: "${MEMORY_REQUEST}"
+            limits:
+              cpu: "${CPU_LIMIT}"
+              memory: "${MEMORY_LIMIT}"
+          volumeMounts:
+            - name: fsx-storage
+              mountPath: ${FSX_MOUNT_PATH}
+            - name: docker-config
+              mountPath: /kaniko/.docker
+      volumes:
+        - name: fsx-storage
+          persistentVolumeClaim:
+            claimName: ${FSX_PVC_NAME}
+        - name: docker-config
+          secret:
+            secretName: ${DOCKER_CONFIG_SECRET}

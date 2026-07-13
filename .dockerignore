@@ -1,0 +1,23 @@
+# Kaniko / image build context — keep small; never bake local venvs or caches.
+.git
+.venv
+venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.tox
+**/*.egg-info
+.worktrees
+docs/superpowers
+*.md
+!requirements.txt
+.env
+**/ags_secrets.conf
+**/secrets*
+runs/
+checkpoints/
+datasets/
+.cursor/
+node_modules/
