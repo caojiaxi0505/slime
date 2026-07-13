@@ -2024,3 +2024,36 @@ def slime_validate_args(args):
                 "--update-weight-mode=delta requires --update-weight-local-checkpoint-dir "
                 "(a rollout-host-local NVMe directory)."
             )
+
+    _maybe_enable_resume_scheduler_override(args)
+
+
+def _maybe_enable_resume_scheduler_override(args) -> None:
+    """Use current LR/WD schedule metadata when resuming a Megatron checkpoint.
+
+    Megatron's OptimizerParamScheduler asserts that lr_warmup_steps,
+    lr_decay_steps, wd_incr_steps, lr_decay_style, max/min_lr, and weight-decay
+    metadata match the checkpoint unless ``override_opt_param_scheduler`` is set.
+
+    Slime derives those fields from ``num_rollout`` (and GBS), which often changes
+    across launches when extending a run. Sample progress still restores from the
+    checkpoint's ``num_steps``; only the schedule shape follows current CLI args.
+    """
+    if getattr(args, "use_checkpoint_opt_param_scheduler", False):
+        return
+    if getattr(args, "override_opt_param_scheduler", False):
+        return
+
+    load_path = getattr(args, "load", None)
+    if not load_path or not os.path.isdir(load_path):
+        return
+    if not os.path.isfile(os.path.join(load_path, "latest_checkpointed_iteration.txt")):
+        return
+
+    args.override_opt_param_scheduler = True
+    logger.info(
+        "Resuming Megatron checkpoint at %s: auto-enabled override_opt_param_scheduler "
+        "(num_rollout-derived LR/WD schedule may differ from checkpoint metadata; "
+        "training progress still restores from checkpoint num_steps).",
+        load_path,
+    )

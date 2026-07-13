@@ -131,6 +131,19 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
     prompt = data.get(prompt_key)
 
     if isinstance(prompt, str):
+        # Parquet / unified pipelines often store OpenAI-style turns as a JSON array string.
+        stripped = prompt.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(prompt)
+                if isinstance(parsed, list) and parsed and all(
+                    isinstance(x, dict) and "role" in x for x in parsed
+                ):
+                    prompt = parsed
+            except json.JSONDecodeError:
+                pass
+
+    if isinstance(prompt, str):
         # If prompt is a string and we don't apply chat template, return the prompt as is.
         if not as_conversation:
             return prompt
@@ -223,6 +236,14 @@ class Dataset:
             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
 
             metadata = data.get(metadata_key) or {}
+            if isinstance(metadata, str):
+                try:
+                    parsed_md = json.loads(metadata)
+                except json.JSONDecodeError:
+                    parsed_md = {}
+                metadata = parsed_md if isinstance(parsed_md, dict) else {}
+            elif not isinstance(metadata, dict):
+                metadata = {}
             tools = None
             if tool_key is not None and tool_key in data:
                 tools = data[tool_key]
@@ -244,12 +265,11 @@ class Dataset:
             else:
                 output_prompt = prompt
 
-            if processor:
+            # Match slime-tencent: only run vision path when prompt is already a message list.
+            # Plain-text prompts remain valid for text-only agent RL with Qwen3.5 processors.
+            if processor and isinstance(prompt, list):
                 from slime.utils.processing_utils import process_vision_info
 
-                assert isinstance(
-                    prompt, list
-                ), f"prompt must be a list when processor is not None, got {type(prompt)} instead"
                 multimodal_inputs = process_vision_info(prompt, processor)
             else:
                 multimodal_inputs = None

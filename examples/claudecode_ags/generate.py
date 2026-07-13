@@ -15,7 +15,7 @@ import traceback
 from typing import Any
 
 from examples.claudecode_ags import agent_runtime
-from examples.claudecode_ags.swe_eval import simple_cmd
+from examples.claudecode_ags.swe_eval import dispatch as swe_eval_dispatch
 from examples.claudecode_ags.swe_eval.base import EvalResult
 from slime.agent.adapters.anthropic_segmented import SegmentedAnthropicAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
@@ -96,9 +96,20 @@ def _build_claude_env(*, adapter_url: str, session_id: str, model_label: str = "
 
 
 def _parse_metadata(sample: Sample) -> dict[str, Any]:
+    from examples.claudecode_ags.bug_patch_source import resolve_swe_smith_bug_patch
+    from examples.claudecode_ags.dataset_normalize import normalize_official_row
+    from examples.claudecode_ags.workspace_init import coerce_install_config, normalize_pre_commands
+
     md = dict(sample.metadata or {})
+    dataset_type = str(md.get("dataset_type") or "").strip()
+    if dataset_type:
+        md = normalize_official_row(md, dataset_type=dataset_type)
+
     prompt = sample.prompt if isinstance(sample.prompt, str) else ""
     problem = md.get("problem_statement") or prompt
+    swebench = md.get("swebench") if isinstance(md.get("swebench"), dict) else {}
+    base_commit = str(md.get("base_commit") or swebench.get("base_commit") or "").strip()
+    patch = resolve_swe_smith_bug_patch(md)
     return {
         "image": (md.get("image") or "").strip(),
         "workdir": (md.get("workdir") or "/testbed").strip(),
@@ -106,7 +117,32 @@ def _parse_metadata(sample: Sample) -> dict[str, Any]:
         "eval_cmd": (md.get("eval_cmd") or "").strip(),
         "instance_id": str(md.get("instance_id") or "unknown"),
         "agent_prompt": (md.get("agent_prompt") or _DEFAULT_AGENT_PROMPT).strip(),
+        "data_source": str(md.get("data_source") or ""),
+        "base_commit": base_commit,
+        "swe_smith_bug_patch": patch or md.get("swe_smith_bug_patch"),
+        "pre_commands": normalize_pre_commands(md.get("pre_commands")),
+        "install_config": coerce_install_config(md.get("install_config")),
+        "cc_source": md.get("cc_source") if isinstance(md.get("cc_source"), dict) else {},
+        "data_path": md.get("data_path"),
+        "dataset_type": str(md.get("dataset_type") or ""),
     }
+
+
+def _f2p_p2p_metrics(base_eval: dict[str, Any]) -> dict[str, Any]:
+    """Flatten F2P/P2P pass ratios from SWE grading details for Wandb."""
+    report = base_eval.get("reward_tests_status") or {}
+    f2p = report.get("FAIL_TO_PASS") or {}
+    p2p = report.get("PASS_TO_PASS") or {}
+    out: dict[str, Any] = {}
+    if "pass_ratio" in f2p:
+        out["test_f2p_ratio"] = float(f2p["pass_ratio"])
+        out["test_f2p_passed"] = int(f2p.get("pass_count") or 0)
+        out["test_f2p_total"] = int(f2p.get("total") or 0)
+    if "pass_ratio" in p2p:
+        out["test_p2p_ratio"] = float(p2p["pass_ratio"])
+        out["test_p2p_passed"] = int(p2p.get("pass_count") or 0)
+        out["test_p2p_total"] = int(p2p.get("total") or 0)
+    return out
 
 
 def _session_id(sample: Sample, instance_id: str) -> str:
@@ -197,12 +233,23 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any], evalua
     try:
         async with asyncio.timeout(guard):
             claude_env = _build_claude_env(adapter_url=state.adapter_url, session_id=session_id)
+            t_agent = time.time()
             async with make_sandbox(md["image"]) as sb:
-                await agent_runtime.prepare_workspace(
-                    sb,
-                    workdir=md["workdir"],
-                    problem_statement=md["problem_statement"],
-                )
+                try:
+                    await agent_runtime.prepare_workspace(
+                        sb,
+                        workdir=md["workdir"],
+                        problem_statement=md["problem_statement"],
+                        instance_id=md["instance_id"],
+                        data_source=md["data_source"],
+                        base_commit=md["base_commit"],
+                        swe_smith_bug_patch=md.get("swe_smith_bug_patch"),
+                        pre_commands=md.get("pre_commands") or "",
+                        install_config=md.get("install_config") or {},
+                        rollout_side=True,
+                    )
+                except RuntimeError as e:
+                    return _abort(sample, f"workspace_init:{e}", instance_id)
                 await agent_runtime.install_toolchain(sb)
                 agent_result = await agent_runtime.run_claude(
                     sb,
@@ -212,14 +259,19 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any], evalua
                     time_budget_sec=time_budget,
                 )
                 diff_text = await agent_runtime.git_diff(sb, workdir=md["workdir"])
+            agent_elapsed = time.time() - t_agent
 
+            # Keep official grading fields (FAIL_TO_PASS, repo, …) from sample.metadata.
+            t_eval = time.time()
             eval_result = await _evaluate_diff(
                 image=md["image"],
                 workdir=md["workdir"],
                 eval_cmd=md["eval_cmd"],
                 diff_text=diff_text,
                 timeout_sec=eval_timeout,
+                metadata={**(sample.metadata or {}), **md},
             )
+            eval_elapsed = time.time() - t_eval
 
             reward_path = getattr(
                 args,
@@ -229,11 +281,18 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any], evalua
             reward_fn = load_function(reward_path)
             base_eval = {"resolved": eval_result.resolved, **eval_result.details}
             reward, reward_details = reward_fn(base_eval=base_eval, sample=sample, args=args)
+            f2p_p2p = _f2p_p2p_metrics(base_eval)
 
             if evaluation:
-                return _eval_only(sample, reward=float(reward), details=reward_details, instance_id=instance_id)
+                return _eval_only(
+                    sample,
+                    reward=float(reward),
+                    details={**reward_details, **f2p_p2p},
+                    instance_id=instance_id,
+                )
 
             segments = await state.adapter.finish_session(session_id)
+            total_elapsed = time.time() - t0
             samples = fan_out_sample_segments(
                 sample,
                 segments,
@@ -246,18 +305,27 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any], evalua
                     "agent_exit_code": agent_result.get("exit_code"),
                     "reward_details": reward_details,
                     "base_eval": base_eval,
+                    "agent_elapsed_sec": agent_elapsed,
+                    "eval_elapsed_sec": eval_elapsed,
+                    "total_elapsed_sec": total_elapsed,
+                    **f2p_p2p,
                 },
             )
             if not samples:
                 return _abort(sample, "adapter_session_empty", instance_id)
 
             logger.info(
-                "[claudecode_ags] %s: reward=%.2f resolved=%s segments=%d elapsed=%.1fs",
+                "[claudecode_ags] %s: reward=%.2f resolved=%s f2p=%s p2p=%s "
+                "segments=%d agent=%.1fs eval=%.1fs elapsed=%.1fs",
                 instance_id,
                 float(reward),
                 bool(eval_result.resolved),
+                f2p_p2p.get("test_f2p_ratio"),
+                f2p_p2p.get("test_p2p_ratio"),
                 len(samples),
-                time.time() - t0,
+                agent_elapsed,
+                eval_elapsed,
+                total_elapsed,
             )
             return samples
 
@@ -286,14 +354,29 @@ async def _evaluate_diff(
     eval_cmd: str,
     diff_text: str,
     timeout_sec: int,
+    metadata: dict[str, Any] | None = None,
 ) -> EvalResult:
-    if not eval_cmd:
-        return EvalResult(resolved=False, applied_cleanly=True, details={"reason": "missing_eval_cmd"})
+    from examples.claudecode_ags.workspace_init import initialize_task_workspace, task_fields_from_metadata
+
+    md = dict(metadata or {})
+    if eval_cmd and not md.get("eval_cmd"):
+        md["eval_cmd"] = eval_cmd
+    if workdir:
+        md["workdir"] = workdir
+
+    fields = task_fields_from_metadata(md)
+    fields.workdir = workdir or fields.workdir
     async with make_sandbox(image) as sb:
-        return await simple_cmd.evaluate(
+        ok = await initialize_task_workspace(sb, fields, rollout_side=False)
+        if not ok:
+            return EvalResult(
+                resolved=False,
+                applied_cleanly=False,
+                details={"reason": "eval_workspace_init_failed"},
+            )
+        return await swe_eval_dispatch.evaluate(
             sb,
-            workdir=workdir,
-            eval_cmd=eval_cmd,
+            metadata=md,
             diff_text=diff_text,
             timeout_sec=timeout_sec,
         )

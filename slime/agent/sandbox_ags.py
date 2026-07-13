@@ -9,13 +9,13 @@ Secrets — either:
 
 Plus:
 
-* ``SLIME_AGENT_AGS_TOOL_ID``
 * ``SLIME_AGENT_AGS_REGION``
 * ``SLIME_AGENT_AGS_DOMAIN``
 * ``SLIME_AGENT_AGS_ROLE_ARN``
 * ``SLIME_AGENT_AGS_HTTP_ENDPOINT``
 
-Optional: ``SLIME_AGENT_AGS_CPU``, ``SLIME_AGENT_AGS_MEMORY``,
+Optional: ``SLIME_AGENT_AGS_TOOL_ID`` (empty → create a new SandboxTool),
+``SLIME_AGENT_AGS_CPU``, ``SLIME_AGENT_AGS_MEMORY``,
 ``SLIME_AGENT_AGS_TIMEOUT``, ``SLIME_AGENT_AGS_PORT``,
 ``SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC``, ``SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC``,
 ``SLIME_AGENT_AGS_IMAGE_REGISTRY_TYPE``, mount-related ``SLIME_AGENT_AGS_MOUNT_*`` /
@@ -40,12 +40,14 @@ logger = logging.getLogger(__name__)
 _REQUIRED_KEYS = (
     "SLIME_AGENT_AGS_SECRET_ID",
     "SLIME_AGENT_AGS_SECRET_KEY",
-    "SLIME_AGENT_AGS_TOOL_ID",
     "SLIME_AGENT_AGS_REGION",
     "SLIME_AGENT_AGS_DOMAIN",
     "SLIME_AGENT_AGS_ROLE_ARN",
     "SLIME_AGENT_AGS_HTTP_ENDPOINT",
 )
+
+# Optional: when unset/empty, SWE-ReX creates a new SandboxTool for the image.
+_OPTIONAL_TOOL_ID = "SLIME_AGENT_AGS_TOOL_ID"
 
 
 def _load_env_file(path: str | Path, *, override: bool = False) -> None:
@@ -70,7 +72,15 @@ def _require_ags_env() -> dict[str, str]:
     """Return required AGS env values, or raise listing every missing key."""
     env_file = os.environ.get("SLIME_AGENT_AGS_ENV_FILE", "").strip()
     if env_file:
-        _load_env_file(env_file, override=False)
+        if Path(env_file).is_file():
+            _load_env_file(env_file, override=False)
+        else:
+            # Placeholder paths from env.example must not block Job-injected secrets.
+            logger.warning(
+                "[agent.sandbox_ags] SLIME_AGENT_AGS_ENV_FILE not found (%s); "
+                "continuing with process env",
+                env_file,
+            )
 
     missing = [k for k in _REQUIRED_KEYS if not (os.environ.get(k) or "").strip()]
     if missing:
@@ -113,7 +123,7 @@ class AGSSandbox:
         kwargs: dict[str, Any] = {
             "secret_id": required["SLIME_AGENT_AGS_SECRET_ID"],
             "secret_key": required["SLIME_AGENT_AGS_SECRET_KEY"],
-            "tool_id": required["SLIME_AGENT_AGS_TOOL_ID"],
+            "tool_id": _optional(_OPTIONAL_TOOL_ID, ""),
             "region": required["SLIME_AGENT_AGS_REGION"],
             "domain": required["SLIME_AGENT_AGS_DOMAIN"],
             "role_arn": required["SLIME_AGENT_AGS_ROLE_ARN"],
@@ -178,7 +188,11 @@ class AGSSandbox:
         env: dict[str, str] | None = None,
         timeout: int = 120,
         check: bool = False,
+        idempotent: bool = True,
     ) -> ExecResult:
+        # ``idempotent`` is accepted for Sandbox protocol parity with E2B
+        # (used by ``run_agent``); AGS does not retry on this flag today.
+        _ = idempotent
         if self._deployment is None or self._rex_command_cls is None:
             raise RuntimeError("AGSSandbox is not started")
 

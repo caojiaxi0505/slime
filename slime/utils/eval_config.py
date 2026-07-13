@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -192,6 +193,12 @@ class EvalDatasetConfig:
 
     def inject_metadata(self, sample_metadata: Any) -> dict[str, Any]:
         """Return updated metadata merging overrides."""
+        if isinstance(sample_metadata, str):
+            try:
+                parsed = json.loads(sample_metadata)
+            except json.JSONDecodeError:
+                parsed = {}
+            sample_metadata = parsed if isinstance(parsed, dict) else {}
         if not isinstance(sample_metadata, dict):
             metadata = {}
         else:

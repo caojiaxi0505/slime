@@ -50,6 +50,7 @@ class Sandbox(Protocol):
         env: dict[str, str] | None = None,
         timeout: int = 120,
         check: bool = False,
+        idempotent: bool = True,
     ) -> ExecResult: ...
 
     async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None: ...
