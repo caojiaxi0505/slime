@@ -13,10 +13,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Sequence
 
-from examples.claudecode_ags.step_reconstruct.edit_ppl import iter_patch_turn_ppls
+from examples.claudecode_ags.step_reconstruct.edit_ppl import StepTurnAlignmentError, iter_patch_turn_ppls
 from examples.claudecode_ags.step_reconstruct.selection import (
     PatchTurnCandidate,
     SelectedTurn,
@@ -40,6 +41,36 @@ def _env_int(name: str, default: int) -> int:
 
 def hybrid_k() -> int:
     return max(1, _env_int("STEP_GRPO_HYBRID_K", 8))
+
+
+def _shared_rollout_id(sample: Sample) -> int:
+    """All siblings from one hybrid_generate must share this id (slime compact)."""
+    if sample.rollout_id is not None:
+        return int(sample.rollout_id)
+    return int(sample.index or 0)
+
+
+def _stamp_shared_rollout_id(samples: list[Sample], parent: Sample) -> list[Sample]:
+    rid = _shared_rollout_id(parent)
+    for s in samples:
+        s.rollout_id = rid
+    return samples
+
+
+def _stamp_hybrid_walls(
+    samples: list[Sample],
+    *,
+    stage1_wall_sec: float,
+    stage2_wall_sec: float,
+    total_wall_sec: float,
+) -> list[Sample]:
+    """Attach per-prompt hybrid phase walls for wandb (step-GRPO extras)."""
+    for s in samples:
+        s.metadata = s.metadata or {}
+        s.metadata["hybrid_stage1_wall_sec"] = float(stage1_wall_sec)
+        s.metadata["hybrid_stage2_wall_sec"] = float(stage2_wall_sec)
+        s.metadata["hybrid_total_wall_sec"] = float(total_wall_sec)
+    return samples
 
 
 def _ppl_clip() -> float:
@@ -122,11 +153,17 @@ async def hybrid_generate(
         )
         for i in range(k)
     ]
+    t_hybrid0 = time.time()
+    t_stage1 = time.time()
     raw = await asyncio.gather(*trial_tasks, return_exceptions=True)
+    stage1_wall = time.time() - t_stage1
 
     trials: list[VanillaTrialResult] = []
     vanilla_samples: list[Sample] = []
     for i, res in enumerate(raw):
+        if isinstance(res, StepTurnAlignmentError):
+            # Strict: never silently degrade to vanilla-only on alignment bugs.
+            raise res
         if isinstance(res, Exception):
             logger.warning("[hybrid] vanilla trial=%d skipped: %s", i, res)
             continue
@@ -147,6 +184,16 @@ async def hybrid_generate(
             )
         )
 
+    def _finish(samples: list[Sample], *, stage2_wall: float = 0.0) -> list[Sample]:
+        total = time.time() - t_hybrid0
+        samples = _stamp_shared_rollout_id(samples, sample)
+        return _stamp_hybrid_walls(
+            samples,
+            stage1_wall_sec=stage1_wall,
+            stage2_wall_sec=stage2_wall,
+            total_wall_sec=total,
+        )
+
     if not trials:
         # Match Path A generate._abort shape so Megatron get_batch never sees
         # empty tokens (pad narrow with prompt_length-1 would go negative).
@@ -164,14 +211,15 @@ async def hybrid_generate(
             "sample_kind": "vanilla",
         }
         logger.warning("[hybrid] all vanilla trials failed; returning aborted sample")
-        return [sample]
+        sample.rollout_id = _shared_rollout_id(sample)
+        return _finish([sample])
 
     if all(t.is_solved for t in trials):
-        return vanilla_samples
+        return _finish(vanilla_samples)
 
     selected = select_branch_turns(trials, k)
     if not selected:
-        return vanilla_samples
+        return _finish(vanilla_samples)
 
     by_trial = {t.trial_idx: t for t in trials}
     branch_tasks = []
@@ -192,7 +240,9 @@ async def hybrid_generate(
                 )
             )
 
+    t_stage2 = time.time()
     branch_raw = await asyncio.gather(*branch_tasks, return_exceptions=True)
+    stage2_wall = time.time() - t_stage2
     branch_samples: list[Sample] = []
     for res in branch_raw:
         if isinstance(res, Exception):
@@ -206,4 +256,4 @@ async def hybrid_generate(
                 s.loss_mask = [1] * max(0, int(getattr(s, "response_length", 0) or len(s.tokens or [])))
             branch_samples.append(s)
 
-    return vanilla_samples + branch_samples
+    return _finish(vanilla_samples + branch_samples, stage2_wall=stage2_wall)

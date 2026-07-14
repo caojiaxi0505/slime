@@ -93,13 +93,15 @@ TRAIN_MEMORY_MARGIN_BYTES="${TRAIN_MEMORY_MARGIN_BYTES:-536870912}"
 # ============ paths / batch ============
 HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/sn-007/jiaxicao/huggingface/models/Qwen/Qwen3.5-9B}"
 REF_MODEL_PATH="${REF_MODEL_PATH:-/mnt/sn-007/jiaxicao/huggingface/models/Qwen/Qwen3.5-9B_torch_dist}"
-PROMPT_DATA="${PROMPT_DATA:-/mnt/sn-007/jiaxicao/code/slime/eval_runs/swegym_passk_20260711_090409/train_step_grpo_resolved_0_7.slime.jsonl}"
+PROMPT_DATA="${PROMPT_DATA:-/mnt/sn-007/jiaxicao/code/slime/eval_runs/swegym_passk_20260711_090409/train_grpo_resolved_1_7.slime.jsonl}"
 EVAL_DATA="${EVAL_DATA:-/mnt/sn-007/youtu-agent/yuleiqin/SWE_code/DataEng/RL_DATA/data_valid/swe_agent_ags_swebench_verified/test.parquet}"
 
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+# Debug-friendly batch defaults (override: ROLLOUT_BATCH_SIZE=16 for formal).
+# slime requires: GBS == RBS * n_samples_per_prompt // num_steps_per_rollout
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 # Outer fan-out is 1; Stage-1 group size is STEP_GRPO_HYBRID_K (internal).
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-1}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-${ROLLOUT_BATCH_SIZE}}"
 # Formal 1-node: save every 5 steps (override SAVE_INTERVAL=1 for crash-debug).
 SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-0}"
@@ -108,7 +110,10 @@ SKIP_EVAL_BEFORE_TRAIN="${SKIP_EVAL_BEFORE_TRAIN:-1}"
 
 # ============ hybrid step-GRPO knobs (exported into Ray runtime) ============
 export STEP_GRPO_HYBRID_K="${STEP_GRPO_HYBRID_K:-8}"
-export STEP_GRPO_BRANCH_CONCURRENCY="${STEP_GRPO_BRANCH_CONCURRENCY:-8}"
+# Stage-2: submit sandboxes in waves of 64 (not an inflight-run cap).
+# Prefer STEP_GRPO_BRANCH_SUBMIT_BATCH; BRANCH_CONCURRENCY is a legacy alias.
+export STEP_GRPO_BRANCH_SUBMIT_BATCH="${STEP_GRPO_BRANCH_SUBMIT_BATCH:-${STEP_GRPO_BRANCH_CONCURRENCY:-64}}"
+export STEP_GRPO_BRANCH_CONCURRENCY="${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
 export STEP_GRPO_PPL_CLIP="${STEP_GRPO_PPL_CLIP:-20}"
 export STEP_GRPO_FILTER="${STEP_GRPO_FILTER:-1}"
 
@@ -118,16 +123,25 @@ if [[ "${PHASE}" == "eval" ]]; then
   EVAL_INTERVAL="${EVAL_INTERVAL:-1}"
 else
   # One pass over 1394 prompts @ rollout_batch=16 → ceil(1394/16)=88.
+  # With RBS=8 default: ceil(1394/8)=175; override NUM_ROLLOUT if you change RBS.
   NUM_ROLLOUT="${NUM_ROLLOUT:-88}"
   EVAL_INTERVAL="${EVAL_INTERVAL:-${NUM_ROLLOUT}}"
 fi
 
-EXP_TAG="${EXP_TAG:-qwen35_9b_cc_ags_1node_hybrid}"
+# Fail fast if batch knobs violate slime_validate_args (GBS == RBS * n_samples // steps).
+_expected_gbs=$(( ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT / 1 ))
+if [[ "${GLOBAL_BATCH_SIZE}" -ne "${_expected_gbs}" ]]; then
+  echo "ERROR: GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must equal ROLLOUT_BATCH_SIZE*N_SAMPLES=${_expected_gbs}" >&2
+  exit 2
+fi
+
+# Fresh default tag — do NOT reuse qwen35_9b_cc_ags_1node_hybrid (empty-run ckpts).
+EXP_TAG="${EXP_TAG:-qwen35_9b_cc_ags_1node_hybrid_ltpa}"
 LOG_DIR="${LOG_DIR:-/mnt/sn-007/jiaxicao/checkpoints/cc-ags/${EXP_TAG}}"
 RUN_ROOT="${RUN_ROOT:-${LOG_DIR}}"
 export STEP_GRPO_BUNDLE_DIR="${STEP_GRPO_BUNDLE_DIR:-${LOG_DIR}/step_reconstruct_bundles}"
 # Avoid inheriting a stale vanilla-GRPO WANDB_GROUP from slime_ags.env.
-if [[ -z "${WANDB_GROUP:-}" || "${WANDB_GROUP}" == "qwen35_9b_cc_ags_1node_grpo_debug" ]]; then
+if [[ -z "${WANDB_GROUP:-}" || "${WANDB_GROUP}" == "qwen35_9b_cc_ags_1node_grpo_debug" || "${WANDB_GROUP}" == "qwen35_9b_cc_ags_1node_hybrid" ]]; then
   WANDB_GROUP="${EXP_TAG}"
 fi
 export WANDB_GROUP
@@ -137,7 +151,8 @@ export WANDB_PROJECT WANDB_TEAM
 
 # ============ AGS + toolchain (cluster defaults; Job env / slime_ags.env win) ============
 export SLIME_AGENT_SANDBOX_BACKEND="${SLIME_AGENT_SANDBOX_BACKEND:-ags}"
-export SLIME_AGENT_AGS_TOOL_ID="${SLIME_AGENT_AGS_TOOL_ID:-sdt-2saifj8n}"
+# Separate AGS tool from vanilla GRPO (sdt-exb9o2gb).
+export SLIME_AGENT_AGS_TOOL_ID="${SLIME_AGENT_AGS_TOOL_ID:-sdt-ltpatoxb}"
 # swerex-runtime mount — avoids ContainerStart / port binding failed (see TROUBLESHOOTING.md)
 export SLIME_AGENT_AGS_MOUNT_NAME="${SLIME_AGENT_AGS_MOUNT_NAME:-rex}"
 export SLIME_AGENT_AGS_MOUNT_IMAGE="${SLIME_AGENT_AGS_MOUNT_IMAGE:-swebenchdocker.tencentcloudcr.com/swebench/swehub:swerex-runtime}"
@@ -157,6 +172,8 @@ export SLIME_AGENT_COS_CC_PACKAGE="${SLIME_AGENT_COS_CC_PACKAGE:-cc-prefix-2.1.1
 export SLIME_CC_TIME_BUDGET_SEC="${SLIME_CC_TIME_BUDGET_SEC:-1800}"
 export SLIME_CC_EVAL_TIMEOUT_SEC="${SLIME_CC_EVAL_TIMEOUT_SEC:-600}"
 export SLIME_AGENT_AGS_TIMEOUT="${SLIME_AGENT_AGS_TIMEOUT:-45m}"
+export SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC="${SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC:-2700}"
+export SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC="${SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC:-600}"
 export STEP_GRPO_BRANCH_BUDGET_SEC="${STEP_GRPO_BRANCH_BUDGET_SEC:-${SLIME_CC_TIME_BUDGET_SEC}}"
 
 # ============ asserts ============
@@ -269,6 +286,7 @@ ROLLOUT_ARGS=(
   --custom-generate-function-path examples.claudecode_ags.step_reconstruct.hybrid_generate.hybrid_generate
   --custom-cc-reward-function-path examples.claudecode_ags.rewards.default.compose
   --custom-reward-post-process-path examples.claudecode_ags.step_reconstruct.step_grpo_advantage.post_process_rewards
+  --custom-rollout-log-function-path examples.claudecode_ags.wandb_metrics.log_rollout_data
 )
 
 # Default-on filter (STEP_GRPO_FILTER=1); set 0 to skip wiring the path.
@@ -397,6 +415,13 @@ MISC_ARGS=(
   --attention-backend flash
   --colocate
 )
+
+if [[ -z "${WANDB_KEY:-}" ]]; then
+  _wandb_key_file="${WANDB_KEY_FILE:-${HOME}/.config/jiaxicao/wandb_api_key}"
+  if [[ -f "${_wandb_key_file}" ]]; then
+    WANDB_KEY="$(tr -d '[:space:]' < "${_wandb_key_file}")"
+  fi
+fi
 
 WANDB_ARGS=()
 if [[ -n "${WANDB_KEY:-}" ]]; then

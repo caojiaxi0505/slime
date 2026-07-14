@@ -12,6 +12,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from examples.claudecode_ags.step_reconstruct import live_runners
 from examples.claudecode_ags.step_reconstruct.session_capture import (
     SessionBundle,
@@ -113,13 +115,38 @@ def test_run_claude_with_prefix_cmd():
     assert "/tmp/cc_prefix.jsonl" in seen["cmd"]
 
 
-def test_collect_turn_logprobs():
-    turn = SimpleNamespace(output_log_probs=[-1.0, -2.0])
-    main = SimpleNamespace(turns=[turn])
-    session = SimpleNamespace(segments=[], active_sub=None, main=main)
+def test_collect_aligned_turn_logprobs_joins_by_tool_use_id():
+    text = SimpleNamespace(output_log_probs=[-0.5])
+    multi = SimpleNamespace(output_log_probs=[-1.0, -2.0])
+    single = SimpleNamespace(output_log_probs=[-3.0])
+    dropped = SimpleNamespace(output_log_probs=[-9.0])
+    session = SimpleNamespace(
+        turn_log=[
+            (text, []),
+            (multi, ["toolu_a", "toolu_b"]),
+            (single, ["toolu_c"]),
+            (dropped, ["toolu_x"]),
+        ]
+    )
     adapter = SimpleNamespace(store={"sid": session})
-    assert live_runners._collect_turn_logprobs(adapter, "sid") == [[-1.0, -2.0]]
-    assert live_runners._collect_turn_logprobs(adapter, "missing") == []
+    assert live_runners._collect_aligned_turn_logprobs(
+        adapter, "sid", step_tool_use_ids=["toolu_a", "toolu_b", "toolu_c"]
+    ) == [
+        [-1.0, -2.0],
+        [-1.0, -2.0],
+        [-3.0],
+    ]
+    assert live_runners._collect_aligned_turn_logprobs(adapter, "missing", step_tool_use_ids=[]) == []
+
+
+def test_collect_aligned_turn_logprobs_missing_id_raises():
+    turn = SimpleNamespace(output_log_probs=[-1.0])
+    session = SimpleNamespace(turn_log=[(turn, ["toolu_a"])])
+    adapter = SimpleNamespace(store={"sid": session})
+    with pytest.raises(live_runners.StepTurnAlignmentError, match="missing_turn_for_steps"):
+        live_runners._collect_aligned_turn_logprobs(
+            adapter, "sid", step_tool_use_ids=["toolu_a", "toolu_missing"]
+        )
 
 
 def test_hybrid_defaults_to_live_runners():
@@ -163,6 +190,31 @@ def test_hybrid_defaults_to_live_runners():
     assert called["v"] == 1
     assert called["b"] == 1
     assert len(out) == 2
+    assert {s.rollout_id for s in out} == {0}
+
+
+def test_trial_and_branch_samples_share_parent_rollout_id():
+    parent = Sample(prompt="p", index=7, group_index=3, rollout_id=7)
+    trial = live_runners._trial_sample(parent, trial_idx=2, base_index=7, group_index=3)
+    assert trial.index == 7 * 4096 + 2
+    assert trial.rollout_id == 7
+
+    parent_no_rid = Sample(prompt="p", index=5, group_index=1)
+    assert live_runners._shared_rollout_id(parent_no_rid) == 5
+    trial2 = live_runners._trial_sample(parent_no_rid, trial_idx=0, base_index=5, group_index=1)
+    assert trial2.rollout_id == 5
+
+
+def test_hybrid_stamps_shared_rollout_id_on_mixed_siblings():
+    from examples.claudecode_ags.step_reconstruct.hybrid_generate import _stamp_shared_rollout_id
+
+    parent = Sample(prompt="p", index=3, group_index=0)
+    siblings = [
+        Sample(prompt="p", index=0, rollout_id=0),
+        Sample(prompt="p", index=1384, rollout_id=1384),
+    ]
+    out = _stamp_shared_rollout_id(siblings, parent)
+    assert [s.rollout_id for s in out] == [3, 3]
 
 
 def test_live_vanilla_runner_happy_path(tmp_path):
@@ -196,6 +248,7 @@ def test_live_vanilla_runner_happy_path(tmp_path):
             segments=[],
             active_sub=None,
             main=SimpleNamespace(turns=[turn]),
+            turn_log=[(turn, ["toolu_happy"])],
         )
     }
     adapter.finish_session = AsyncMock(return_value=[{"tokens": [1, 2], "response_length": 1}])
@@ -213,12 +266,14 @@ def test_live_vanilla_runner_happy_path(tmp_path):
     sandbox_cm.__aenter__ = AsyncMock(return_value=sb)
     sandbox_cm.__aexit__ = AsyncMock(return_value=False)
 
+    steps = steps_from_diff_files(str(tmp_path), ["diff --git a/a b/a\n+1\n"])
+    steps[0].tool_use_id = "toolu_happy"
     bundle = SessionBundle(
         instance_id="inst",
         session_id="sid",
         cc_session_id="",
         task_metadata=md,
-        steps=[],
+        steps=steps,
         dir=str(tmp_path),
     )
     bundle.save(str(tmp_path))
@@ -335,9 +390,10 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
     sample = Sample(prompt="p", index=0, group_index=3, metadata={})
     eval_result = SimpleNamespace(resolved=True, applied_cleanly=True, details={})
 
-    def fake_fan_out(sample, segments, reward=0.0, tokenizer=None, metadata=None):
+    def fake_fan_out(sample, segments, reward=0.0, tokenizer=None, metadata=None, rollout_id=None):
         s = Sample(prompt="p", index=1, group_index=3, reward=float(reward), response_length=2, metadata={})
         s.metadata = dict(metadata or {})
+        s.rollout_id = sample.rollout_id if rollout_id is None else rollout_id
         s.loss_mask = None
         return [s]
 
@@ -397,3 +453,4 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
     assert samples[0].metadata["step_group_key"] == "3:1:0"
     assert samples[0].metadata["edit_ppl"] == 4.5
     assert samples[0].loss_mask == [1, 1]
+    assert samples[0].rollout_id == 0

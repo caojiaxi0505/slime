@@ -51,10 +51,16 @@ SLIME_ADAPTER_PUBLIC_URL="${SLIME_ADAPTER_PUBLIC_URL:-http://k8s-sn5syste-jiaxic
 SLIME_ADAPTER_PUBLIC_URL="${SLIME_ADAPTER_PUBLIC_URL%/}"
 SLIME_AGENT_AGS_TOOL_ID="${SLIME_AGENT_AGS_TOOL_ID:-sdt-exb9o2gb}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-22}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 WANDB_PROJECT="${WANDB_PROJECT:-coding-rl}"
 WANDB_GROUP="${WANDB_GROUP:-${EXP_TAG}}"
 WANDB_TEAM="${WANDB_TEAM:-models-tencent7723}"
+if [[ -z "${WANDB_KEY:-}" ]]; then
+  _wandb_key_file="${WANDB_KEY_FILE:-${HOME}/.config/jiaxicao/wandb_api_key}"
+  if [[ -f "${_wandb_key_file}" ]]; then
+    WANDB_KEY="$(tr -d '[:space:]' < "${_wandb_key_file}")"
+  fi
+fi
 WANDB_KEY="${WANDB_KEY:-}"
 
 if [[ "${DELETE}" == "1" ]]; then

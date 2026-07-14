@@ -105,7 +105,7 @@ spec:
                 - name: CP_SIZE
                   value: "8"
                 - name: ROLLOUT_BATCH_SIZE
-                  value: "16"
+                  value: "${ROLLOUT_BATCH_SIZE}"
                 - name: N_SAMPLES_PER_PROMPT
                   value: "1"
                 - name: GLOBAL_BATCH_SIZE
@@ -116,6 +116,8 @@ spec:
                   value: "${SAVE_INTERVAL}"
                 - name: STEP_GRPO_HYBRID_K
                   value: "${STEP_GRPO_HYBRID_K}"
+                - name: STEP_GRPO_BRANCH_SUBMIT_BATCH
+                  value: "${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
                 - name: STEP_GRPO_BRANCH_CONCURRENCY
                   value: "${STEP_GRPO_BRANCH_CONCURRENCY}"
                 - name: STEP_GRPO_PPL_CLIP
@@ -140,9 +142,9 @@ spec:
                     secretKeyRef:
                       name: ${AGS_SECRET_NAME}
                       key: AGS_SECRET_KEY
-                # See examples/claudecode_ags/TROUBLESHOOTING.md (port binding → MOUNT_*).
+                # Separate AGS tool from vanilla GRPO (sdt-exb9o2gb). Override via submit.
                 - name: SLIME_AGENT_AGS_TOOL_ID
-                  value: "sdt-2saifj8n"
+                  value: ${SLIME_AGENT_AGS_TOOL_ID}
                 - name: SLIME_AGENT_AGS_MOUNT_NAME
                   value: "rex"
                 - name: SLIME_AGENT_AGS_MOUNT_IMAGE
@@ -177,6 +179,8 @@ spec:
                   value: "45m"
                 - name: SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC
                   value: "2700"
+                - name: SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC
+                  value: "600"
                 - name: PATH
                   value: /root/miniconda3/envs/agent-lightning/bin:/root/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
                 - name: NCCL_SOCKET_IFNAME

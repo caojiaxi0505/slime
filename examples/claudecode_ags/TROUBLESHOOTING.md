@@ -99,3 +99,11 @@ aborted: adapter_session_empty
 404 ... /execute                  # 沙箱已回收 / 租期到
 perf N: response_len/mean ...     # 0 = 仍空；>0 = 已有真实轨迹
 ```
+
+---
+
+## Hybrid step-GRPO（2026-07-13）
+
+联调修复（`missing_eval_plan` 全 0 分、tool_use_id 对齐、wandb Stage-1/2 口径、同池数据等）见：
+
+**[`docs/superpowers/notes/2026-07-13-hybrid-step-grpo-debug-fixes.md`](../../docs/superpowers/notes/2026-07-13-hybrid-step-grpo-debug-fixes.md)**

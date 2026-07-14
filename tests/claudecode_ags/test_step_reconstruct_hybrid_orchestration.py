@@ -3,6 +3,8 @@ import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from examples.claudecode_ags.step_reconstruct.hybrid_generate import (
     VanillaTrialResult,
     collect_patch_candidates,
@@ -141,6 +143,27 @@ def test_hybrid_all_trials_fail_returns_abort_sample():
     assert s.response_length == 1
     assert s.loss_mask == [0]
     assert s.metadata["abort_reason"] == "all_vanilla_trials_failed"
+
+
+def test_hybrid_step_turn_mismatch_raises():
+    """Alignment bugs must not silently degrade to vanilla-only."""
+    from examples.claudecode_ags.step_reconstruct.edit_ppl import StepTurnAlignmentError
+
+    os.environ["STEP_GRPO_HYBRID_K"] = "2"
+
+    async def vanilla_runner(**kwargs):
+        raise StepTurnAlignmentError("step_turn_mismatch: aligned_tool_turns=1 num_steps=2")
+
+    with pytest.raises(StepTurnAlignmentError, match="step_turn_mismatch"):
+        asyncio.run(
+            hybrid_generate(
+                SimpleNamespace(),
+                _sample(),
+                {},
+                vanilla_runner=vanilla_runner,
+                branch_runner=AsyncMock(),
+            )
+        )
 
 
 def test_eval_delegates_to_path_a_generate():

@@ -68,6 +68,8 @@ class Session:
     max_context_tokens: int = 0
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
     segments: list[TurnSegment] = dataclasses.field(default_factory=list)
+    # Chronological (turn, tool_use_ids) log; survives wipe clears of chain.turns.
+    turn_log: list[tuple[TurnRecord, list[str]]] = dataclasses.field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +221,27 @@ def append_turn(target: Chain, turn: TurnRecord) -> None:
     target.turns.append(turn)
 
 
+def record_turn(
+    session: Session,
+    target: Chain,
+    turn: TurnRecord,
+    *,
+    tool_use_ids: list[str] | None = None,
+    n_tool_uses: int | None = None,
+) -> None:
+    """Append to the active chain and the session-wide chronological turn log.
+
+    Prefer ``tool_use_ids`` (minted Anthropic ids). ``n_tool_uses`` is accepted
+    only for older unit tests that do not mint ids.
+    """
+    append_turn(target, turn)
+    ids = [str(x) for x in (tool_use_ids or []) if str(x).strip()]
+    if not ids and n_tool_uses:
+        # Test helper: synthesize stable ids when callers only know the count.
+        ids = [f"toolu_test_{i}" for i in range(int(n_tool_uses))]
+    session.turn_log.append((turn, ids))
+
+
 def drain_session_segments(session: Session) -> list[TokenSegment]:
     """Freeze remaining sub as ``subagent`` and main as ``final``, then merge."""
     if session.active_sub is not None and session.active_sub.turns:
@@ -368,7 +391,12 @@ class SegmentedAnthropicAdapter:
                 blocks, stop_reason, dispatch_id = self._parse_and_blocks(
                     target, turn.output_ids, turn.finish_reason
                 )
-                append_turn(target, turn)
+                tool_use_ids = [
+                    str(b.get("id") or "")
+                    for b in blocks
+                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+                ]
+                record_turn(session, target, turn, tool_use_ids=tool_use_ids)
                 if dispatch_id and not is_sub:
                     start_sub_chain(session, dispatch_id)
                 in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
@@ -393,6 +421,7 @@ __all__ = [
     "drain_session_segments",
     "freeze_chain",
     "message_hash",
+    "record_turn",
     "select_chain",
     "start_sub_chain",
 ]

@@ -182,6 +182,18 @@ async def pull_remote_dir(sb, remote_dir: str, local_parent: str) -> str | None:
     return os.path.join(local_parent, name)
 
 
+def _tool_use_id_from_payload(snap_dir: str, sid: str) -> str:
+    path = os.path.join(snap_dir, f"step_{sid}.payload.json")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            obj = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(obj.get("tool_use_id") or "")
+
+
 def build_hook_steps_from_snap_dir(snap_dir: str, bundle_dir: str) -> list[StepRecord]:
     """Build StepRecords from pulled snapshots; keep PostToolUse hook only.
 
@@ -224,6 +236,7 @@ def build_hook_steps_from_snap_dir(snap_dir: str, bundle_dir: str) -> list[StepR
                         ts=int(obj.get("ts") or 0),
                         source="hook",
                         tool_name=str(obj.get("tool_name") or ""),
+                        tool_use_id=_tool_use_id_from_payload(snap_dir, sid),
                         diff_file=rel,
                     )
                 )
@@ -234,7 +247,15 @@ def build_hook_steps_from_snap_dir(snap_dir: str, bundle_dir: str) -> list[StepR
     names = sorted(n for n in os.listdir(snap_dir) if n.startswith("step_") and n.endswith(".diff"))
     for i, name in enumerate(names):
         rel = os.path.relpath(os.path.join(snap_dir, name), bundle_dir)
-        steps.append(StepRecord(seq=i + 1, source="hook", diff_file=rel))
+        sid = name[len("step_") : -len(".diff")]
+        steps.append(
+            StepRecord(
+                seq=i + 1,
+                source="hook",
+                tool_use_id=_tool_use_id_from_payload(snap_dir, sid),
+                diff_file=rel,
+            )
+        )
     return steps
 
 

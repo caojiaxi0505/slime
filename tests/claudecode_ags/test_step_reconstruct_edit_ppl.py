@@ -1,4 +1,11 @@
-from examples.claudecode_ags.step_reconstruct.edit_ppl import PatchTurnPPL, iter_patch_turn_ppls
+import pytest
+
+from examples.claudecode_ags.step_reconstruct.edit_ppl import (
+    PatchTurnPPL,
+    StepTurnAlignmentError,
+    align_logprobs_to_steps,
+    iter_patch_turn_ppls,
+)
 
 
 def test_iter_patch_turn_ppls_detects_diff_changes():
@@ -18,5 +25,27 @@ def test_iter_patch_turn_ppls_clips():
     assert got[0].edit_ppl == 5.0
 
 
-def test_iter_patch_turn_ppls_mismatch_returns_empty():
-    assert iter_patch_turn_ppls(["a", "b"], [[-1.0]], clip=20.0) == []
+def test_iter_patch_turn_ppls_mismatch_raises():
+    with pytest.raises(StepTurnAlignmentError, match="step_turn_mismatch"):
+        iter_patch_turn_ppls(["a", "b"], [[-1.0]], clip=20.0)
+
+
+def test_align_by_tool_use_id_joins_and_drops_extras():
+    # text-only, multi-tool turn, single-tool; only snapshotted ids must align
+    entries = [
+        ([-0.1], []),
+        ([-1.0, -1.0], ["toolu_a", "toolu_b"]),
+        ([-2.0], ["toolu_c"]),
+        ([-9.0], ["toolu_dropped"]),  # emitted but no PostToolUse snapshot
+    ]
+    got = align_logprobs_to_steps(entries, ["toolu_a", "toolu_b", "toolu_c"])
+    assert got == [[-1.0, -1.0], [-1.0, -1.0], [-2.0]]
+
+
+def test_align_missing_step_id_raises():
+    with pytest.raises(StepTurnAlignmentError, match="missing_turn_for_steps"):
+        align_logprobs_to_steps([([-1.0], ["toolu_a"])], ["toolu_a", "toolu_missing"])
+
+
+def test_align_zero_steps_ok():
+    assert align_logprobs_to_steps([([-0.1], [])], []) == []

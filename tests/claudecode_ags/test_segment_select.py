@@ -4,6 +4,7 @@ from slime.agent.adapters.anthropic_segmented import (
     Session,
     append_turn,
     commit_fingerprint,
+    record_turn,
     select_chain,
     start_sub_chain,
 )
@@ -125,3 +126,23 @@ def test_tool_result_for_pending_dispatch_closes_sub_as_subagent():
     assert target2 is s.main
     assert is_sub2 is False
     assert kind2 == "append"
+
+
+def test_record_turn_keeps_chronological_log_across_wipe():
+    """turn_log must survive wipe clears so PostToolUse steps can align."""
+    s = Session()
+    body1 = {"messages": [_user("a")], "system": "sys"}
+    target, _, kind = select_chain(s, body1)
+    commit_fingerprint(target, body1, kind)
+    record_turn(s, target, _turn(prompt=(1,), output=(2,)), tool_use_ids=["toolu_1"])
+
+    # Wipe: fingerprints diverge → prior turns freeze/clear on chain, log stays.
+    body2 = {"messages": [_user("b")], "system": "sys"}
+    target2, _, kind2 = select_chain(s, body2)
+    assert kind2 == "wipe"
+    commit_fingerprint(target2, body2, kind2)
+    assert target2.turns == []
+    record_turn(s, target2, _turn(prompt=(3,), output=(4,)), tool_use_ids=["toolu_2", "toolu_3"])
+
+    assert len(s.turn_log) == 2
+    assert [ids for _, ids in s.turn_log] == [["toolu_1"], ["toolu_2", "toolu_3"]]

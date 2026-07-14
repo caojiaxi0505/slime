@@ -10,8 +10,8 @@
 # ---------------------------------------------------------------------------
 # AGS sandboxes cannot reach 127.0.0.1 / localhost on the train node.
 # Export a public/ALB (or node) URL that routes to THIS job's adapter port
-# (SLIME_ADAPTER_PORT, default 18001). Do NOT reuse the deleted L2 Ingress /
-# jiaxicao-cc-ags-adapter Deployment URL.
+# (SLIME_ADAPTER_PORT, default 9002 for HyperPod ALB). Do NOT reuse the
+# deleted L2 Ingress / jiaxicao-cc-ags-adapter Deployment URL.
 #
 # ---------------------------------------------------------------------------
 # PHASE
@@ -23,7 +23,7 @@
 #           Prefer this over a 1-row dummy prompt; 0 is explicitly supported.
 #
 # Usage:
-#   export SLIME_ADAPTER_PUBLIC_URL=http://<reachable-host>:18001
+#   export SLIME_ADAPTER_PUBLIC_URL=http://<alb-hostname>   # ALB :80, no :9002
 #   bash examples/claudecode_ags/launch/run_grpo_1node_debug.sh          # dry-run
 #   RUN=1 bash examples/claudecode_ags/launch/run_grpo_1node_debug.sh    # execute
 #   PHASE=eval RUN=1 bash examples/claudecode_ags/launch/run_grpo_1node_debug.sh
@@ -97,6 +97,8 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
+# Plan A: default off — colocate sleep left host ~14Gi with Adam CPU offload.
+OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-0}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-1}"
 SKIP_EVAL_BEFORE_TRAIN="${SKIP_EVAL_BEFORE_TRAIN:-1}"
 
@@ -127,6 +129,11 @@ fi
 SLIME_ADAPTER_PUBLIC_URL="${SLIME_ADAPTER_PUBLIC_URL%/}"
 export SLIME_ADAPTER_PUBLIC_URL
 export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-${SLIME_ADAPTER_PUBLIC_URL}}"
+# Path A listens on SLIME_ADAPTER_PORT; HyperPod GRPO ALBs target :9002.
+export SLIME_ADAPTER_PORT="${SLIME_ADAPTER_PORT:-9002}"
+export SHIM_PORT="${SHIM_PORT:-${SLIME_ADAPTER_PORT}}"
+export SHIM_BIND_HOST="${SHIM_BIND_HOST:-0.0.0.0}"
+export SLIME_ADAPTER_BIND_HOST="${SLIME_ADAPTER_BIND_HOST:-0.0.0.0}"
 
 if [[ ! -d "${HF_CHECKPOINT}" ]]; then
   echo "ERROR: HF_CHECKPOINT not found: ${HF_CHECKPOINT}" >&2
@@ -265,10 +272,11 @@ OPTIMIZER_ARGS=(
   --weight-decay 0.1
   --adam-beta1 0.9
   --adam-beta2 0.98
-  --optimizer-cpu-offload
-  --overlap-cpu-optimizer-d2h-h2d
   --use-precision-aware-optimizer
 )
+if [[ "${OPTIMIZER_CPU_OFFLOAD}" == "1" ]]; then
+  OPTIMIZER_ARGS+=(--optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d)
+fi
 
 SGLANG_HICACHE_ARGS=()
 if [[ "${SGLANG_ENABLE_HICACHE}" == "1" ]]; then
@@ -313,15 +321,25 @@ MISC_ARGS=(
   --colocate
 )
 
+if [[ -z "${WANDB_KEY:-}" ]]; then
+  _wandb_key_file="${WANDB_KEY_FILE:-${HOME}/.config/jiaxicao/wandb_api_key}"
+  if [[ -f "${_wandb_key_file}" ]]; then
+    WANDB_KEY="$(tr -d '[:space:]' < "${_wandb_key_file}")"
+  fi
+fi
+
 WANDB_ARGS=()
 if [[ -n "${WANDB_KEY:-}" ]]; then
   WANDB_ARGS=(
     --use-wandb
-    --wandb-project "${WANDB_PROJECT:-cc-ags}"
+    --wandb-project "${WANDB_PROJECT:-coding-rl}"
     --wandb-group "${WANDB_GROUP:-${EXP_TAG}}"
     --wandb-key "${WANDB_KEY}"
     --wandb-dir "${LOG_DIR}/wandb"
   )
+  if [[ -n "${WANDB_TEAM:-}" ]]; then
+    WANDB_ARGS+=(--wandb-team "${WANDB_TEAM}")
+  fi
 fi
 
 # ============ ray network (1-node head only) ============

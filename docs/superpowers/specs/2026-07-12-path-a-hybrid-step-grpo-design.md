@@ -197,9 +197,10 @@ Stage-2 分叉
 ## 10. 后续（明确不在库轮；launcher 已落地）
 
 1. ~~`run_hybrid_1node_*.sh` + PyTorchJob 模板~~ → `launch/run_hybrid_1node_debug.sh` + `hybrid_1node_job/` + `hybrid_adapter_alb/`
-2. 数据：step-GRPO 倾向 resolved 0–7 池（见 `notes/2026-07-12-swegym-filter-passk-results.md`）。
+2. 数据：对比实验默认与朴素 GRPO 同池 `train_grpo_resolved_1_7`（见 `notes/2026-07-13-hybrid-step-grpo-debug-fixes.md` §5）；更大的 `resolved_0_7` 池可显式覆盖 `PROMPT_DATA`。
 3. 真 AGS 冒烟与 1-node debug 训通。
 4. OPSD（若需要）。
+5. 联调修复纪要：`notes/2026-07-13-hybrid-step-grpo-debug-fixes.md`（rollout_id、tool_use_id 对齐、missing_eval_plan、wandb 口径）。
 
 ## 11. 审阅结论（已拍板）
 
