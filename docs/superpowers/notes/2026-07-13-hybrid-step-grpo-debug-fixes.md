@@ -60,3 +60,17 @@
 | vanilla log | `reward=` 有 0/1 | 全 0 且 dump 里 `missing_eval_plan` |
 | wandb | `outcome/resolved_rate`≈Stage-1；有 `outcome/stage-2/*` | 只有假 0、无 f2p |
 | PROMPT_DATA | `…/train_grpo_resolved_1_7.slime.jsonl` | `…resolved_0_7…` |
+
+---
+
+## 6. Vanilla 假 std0：共享 `rollout_id` 把 K 次尝试合成一条（2026-07-14）
+
+见：`notes/2026-07-14-hybrid-vanilla-episode-key-bug.md`（消融）· 总手册：`notes/2026-07-14-step-grpo-experiment-handbook.md`。
+
+---
+
+## 7. Branch `loss_mask` 全 1 → TIS/RS 误杀（2026-07-14）
+
+见：`notes/2026-07-14-hybrid-branch-loss-mask-tis-rs-bug.md`。  
+**摘要：** 勿把 tool/context 标成可训；保留 `merge_turns` 的 mask/logprob 合同，否则 `mis_kl` 爆炸、`grad_norm` 虚低。
+

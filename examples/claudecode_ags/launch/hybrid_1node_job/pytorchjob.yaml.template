@@ -9,7 +9,7 @@ metadata:
   namespace: ${K8S_NAMESPACE}
   labels:
     owner: jiaxicao
-    workload: jiaxicao-hybrid-1node-debug
+    workload: ${WORKLOAD_LABEL}
 spec:
   nprocPerNode: "8"
   pytorchReplicaSpecs:
@@ -20,7 +20,7 @@ spec:
         metadata:
           labels:
             app: cc-ags-recorder
-            workload: jiaxicao-hybrid-1node-debug
+            workload: ${WORKLOAD_LABEL}
             owner: jiaxicao
         spec:
           nodeSelector:

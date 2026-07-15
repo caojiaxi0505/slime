@@ -3,9 +3,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATE="${SCRIPT_DIR}/service-ingress.yaml.template"
 YAML="${SCRIPT_DIR}/service-ingress.yaml"
 K8S_NAMESPACE="${K8S_NAMESPACE:-sn5-system-intern}"
 NAME="${NAME:-jiaxicao-hybrid-1node-debug-adapter}"
+WORKLOAD_LABEL="${WORKLOAD_LABEL:-jiaxicao-hybrid-1node-debug}"
 
 usage() {
   cat <<'EOF'
@@ -30,10 +32,15 @@ for arg in "$@"; do
   esac
 done
 
-if [[ ! -f "${YAML}" ]]; then
-  echo "ERROR: missing ${YAML}" >&2
+if [[ ! -f "${TEMPLATE}" ]]; then
+  echo "ERROR: missing ${TEMPLATE}" >&2
   exit 1
 fi
+
+export NAME K8S_NAMESPACE WORKLOAD_LABEL
+RENDERED="$(mktemp)"
+envsubst '${NAME} ${K8S_NAMESPACE} ${WORKLOAD_LABEL}' < "${TEMPLATE}" > "${RENDERED}"
+YAML="${RENDERED}"
 
 if [[ "${DELETE}" == "1" ]]; then
   kubectl -n "${K8S_NAMESPACE}" delete ingress "${NAME}" --ignore-not-found
@@ -49,6 +56,7 @@ fi
 
 echo "==> apply ${NAME} in ${K8S_NAMESPACE}"
 kubectl apply -f "${YAML}"
+rm -f "${RENDERED}"
 
 echo "==> waiting for Ingress ADDRESS (ALB provision can take 1–3 min)..."
 for _ in $(seq 1 60); do
@@ -60,7 +68,7 @@ for _ in $(seq 1 60); do
     echo
     echo "Notes:"
     echo "  - ALB listens on :80 (no :9002 in the URL)."
-    echo "  - Master pod must have labels app=cc-ags-recorder,workload=jiaxicao-hybrid-1node-debug"
+    echo "  - Master pod must have labels app=cc-ags-recorder,workload=${WORKLOAD_LABEL}"
     echo "  - Adapter must bind SLIME_ADAPTER_PORT=9002 (Path A) / SHIM_PORT=9002"
     echo "  - /health will be UNHEALTHY until train adapter is up — expected"
     exit 0

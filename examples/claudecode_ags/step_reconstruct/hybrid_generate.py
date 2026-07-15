@@ -172,6 +172,7 @@ async def hybrid_generate(
             s.metadata = s.metadata or {}
             s.metadata["sample_kind"] = "vanilla"
             s.metadata["trial_idx"] = i
+            s.metadata.setdefault("branch_uid", f"v:{group_index}:t{i}")
             s.group_index = group_index
         vanilla_samples.extend(samples)
         trials.append(
@@ -251,9 +252,9 @@ async def hybrid_generate(
         for s in res:
             s.metadata = s.metadata or {}
             s.metadata.setdefault("sample_kind", "branch")
-            # Full continuation is trainable (not first_action).
-            if s.loss_mask is None and s.tokens is not None:
-                s.loss_mask = [1] * max(0, int(getattr(s, "response_length", 0) or len(s.tokens or [])))
+            # Do not rewrite loss_mask: merge_turns already marks every assistant
+            # token in the continuation as trainable (vs first_action), and keeps
+            # tool/context tails at 0 with placeholder rollout_log_probs.
             branch_samples.append(s)
 
     return _finish(vanilla_samples + branch_samples, stage2_wall=stage2_wall)

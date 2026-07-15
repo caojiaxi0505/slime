@@ -51,6 +51,13 @@ async def rebuilt_workspace(bundle: SessionBundle, step_t: int) -> AsyncIterator
             sb,
             workdir=workdir,
             problem_statement=str(md.get("problem_statement") or ""),
+            instance_id=str(md.get("instance_id") or bundle.instance_id or ""),
+            data_source=str(md.get("data_source") or ""),
+            base_commit=str(md.get("base_commit") or ""),
+            swe_smith_bug_patch=md.get("swe_smith_bug_patch"),
+            pre_commands=md.get("pre_commands") or "",
+            install_config=md.get("install_config") or {},
+            rollout_side=True,
         )
         applied = await apply_diff(sb, workdir, diff_text)
         if not applied:

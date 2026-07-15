@@ -51,7 +51,7 @@ case "${PHASE}" in
     ;;
 esac
 
-# ============ topology (1 node / 8 GPU colocate) ============
+# ============ topology (colocate; override ACTOR_NUM_NODES for multi-node) ============
 export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
 export ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
 export TP_SIZE="${TP_SIZE:-1}"
@@ -60,7 +60,8 @@ export CP_SIZE="${CP_SIZE:-8}"
 export EP_SIZE="${EP_SIZE:-1}"
 export ETP_SIZE="${ETP_SIZE:-1}"
 
-ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-8}"
+# Default rollout GPUs = all actor GPUs (colocate).
+ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))}"
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-1}"
 ROLLOUT_MEM_UTILIZATION="${ROLLOUT_MEM_UTILIZATION:-0.75}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-64}"
@@ -168,13 +169,16 @@ export SLIME_AGENT_COS_MOUNT="${SLIME_AGENT_COS_MOUNT:-/mnt/code_agent}"
 export SLIME_AGENT_COS_NODE_PACKAGE="${SLIME_AGENT_COS_NODE_PACKAGE:-node-v20.18.1-linux-x64.tar.xz}"
 export SLIME_AGENT_COS_CC_PACKAGE="${SLIME_AGENT_COS_CC_PACKAGE:-cc-prefix-2.1.104-linux-x64.tar.gz}"
 
-# ============ timeouts (export if unset) ============
-export SLIME_CC_TIME_BUDGET_SEC="${SLIME_CC_TIME_BUDGET_SEC:-1800}"
+# ============ timeouts / concurrency (export if unset) ============
+# Agent budget 45m; AGS lifetime above that so sandbox outlives CC.
+export SLIME_CC_TIME_BUDGET_SEC="${SLIME_CC_TIME_BUDGET_SEC:-2700}"
 export SLIME_CC_EVAL_TIMEOUT_SEC="${SLIME_CC_EVAL_TIMEOUT_SEC:-600}"
-export SLIME_AGENT_AGS_TIMEOUT="${SLIME_AGENT_AGS_TIMEOUT:-45m}"
-export SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC="${SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC:-2700}"
+export SLIME_AGENT_AGS_TIMEOUT="${SLIME_AGENT_AGS_TIMEOUT:-75m}"
+export SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC="${SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC:-4500}"
 export SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC="${SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC:-600}"
 export STEP_GRPO_BRANCH_BUDGET_SEC="${STEP_GRPO_BRANCH_BUDGET_SEC:-${SLIME_CC_TIME_BUDGET_SEC}}"
+# True in-flight agent cap (vanilla + branch); <=0 disables.
+export SLIME_CC_AGENT_CONCURRENCY="${SLIME_CC_AGENT_CONCURRENCY:-64}"
 
 # ============ asserts ============
 if [[ -z "${SLIME_ADAPTER_PUBLIC_URL:-}" || "${SLIME_ADAPTER_PUBLIC_URL}" == *REPLACE_WITH* ]]; then
@@ -437,7 +441,8 @@ if [[ -n "${WANDB_KEY:-}" ]]; then
   fi
 fi
 
-# ============ ray network (1-node head only) ============
+# ============ ray network ============
+# Kubeflow sets MASTER_ADDR for multi-node; fall back to local IP for 1-node.
 export MASTER_ADDR="${MASTER_ADDR:-$(hostname -I | awk '{print $1}')}"
 export MASTER_PORT="${MASTER_PORT:-6379}"
 RAY_GCS_PORT="${RAY_GCS_PORT:-6379}"
@@ -465,7 +470,7 @@ TRAIN_CMD=(
 )
 
 echo "======================================================================"
-echo "Path A GRPO 1-node debug (PHASE=${PHASE} RUN=${RUN})"
+echo "Path A hybrid step-GRPO (PHASE=${PHASE} RUN=${RUN} nodes=${ACTOR_NUM_NODES})"
 echo "SLIME_DIR=${SLIME_DIR}"
 echo "LOG_DIR=${LOG_DIR}"
 echo "ACTOR_NUM_NODES=${ACTOR_NUM_NODES} GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE}"
@@ -491,8 +496,12 @@ mkdir -p \
   "${LOG_DIR}/rollout_dumps" \
   "${LOG_DIR}/launcher_logs"
 
-# ============ bring up ray (1-node head; no worker loop) ============
+# ============ bring up ray (multi-node via Kubeflow RANK) ============
+# RANK=0 (Master): start Ray head + train. RANK>0 (Worker): join and idle.
+NODE_RANK="${RANK:-${PET_NODE_RANK:-0}}"
+EXPECTED_GPUS=$(( ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE ))
 USE_EXTERNAL_RAY="${USE_EXTERNAL_RAY:-0}"
+
 if [[ "${USE_EXTERNAL_RAY}" != "1" ]]; then
   pkill -9 sglang 2>/dev/null || true
   sleep 2
@@ -500,16 +509,58 @@ if [[ "${USE_EXTERNAL_RAY}" != "1" ]]; then
   pkill -9 ray 2>/dev/null || true
   sleep 2
 
+  if [[ "${NODE_RANK}" != "0" ]]; then
+    echo "Ray worker NODE_RANK=${NODE_RANK}; joining ${MASTER_ADDR}:${RAY_GCS_PORT}"
+    _worker_ip="$(hostname -I | awk '{print $1}')"
+    for _i in $(seq 1 180); do
+      if ray start --address="${MASTER_ADDR}:${RAY_GCS_PORT}" \
+          --node-ip-address "${_worker_ip}" \
+          --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
+          --disable-usage-stats; then
+        echo "Ray worker joined."
+        break
+      fi
+      echo "Waiting for Ray head... (${_i}/180)"
+      sleep 5
+    done
+    echo "Worker idle (Ray joined); sleeping until Master finishes."
+    sleep infinity
+  fi
+
+  # Master / single-node head
+  # Prefer operator-provided MASTER_ADDR when multi-node; else local IP.
+  if [[ "${ACTOR_NUM_NODES}" -le 1 ]]; then
+    export MASTER_ADDR="${MASTER_ADDR:-$(hostname -I | awk '{print $1}')}"
+  fi
+  _head_ip="$(hostname -I | awk '{print $1}')"
   ray start --head \
-    --node-ip-address "${MASTER_ADDR}" \
+    --node-ip-address "${_head_ip}" \
     --port "${RAY_GCS_PORT}" \
     --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
     --disable-usage-stats \
     --dashboard-host=0.0.0.0 \
     --dashboard-port "${RAY_DASHBOARD_PORT}"
 
-  echo "Waiting for Ray head to stabilize..."
-  sleep 10
+  echo "Waiting for Ray cluster GPUs >= ${EXPECTED_GPUS} (nodes=${ACTOR_NUM_NODES})..."
+  for _i in $(seq 1 180); do
+    _gpus="$(python3 - <<'PY'
+import re, subprocess
+try:
+    out = subprocess.check_output(["ray", "status"], text=True, stderr=subprocess.STDOUT)
+except Exception as e:
+    print(0)
+    raise SystemExit
+# Match lines like "0.0/16.0 GPU" or "16.0/16.0 GPU"
+m = re.search(r"([\d.]+)/([\d.]+)\s+GPU", out)
+print(int(float(m.group(2))) if m else 0)
+PY
+)"
+    echo "  ray GPUs total=${_gpus} (want ${EXPECTED_GPUS}) try=${_i}"
+    if [[ "${_gpus}" -ge "${EXPECTED_GPUS}" ]]; then
+      break
+    fi
+    sleep 5
+  done
   ray status
 else
   echo "USE_EXTERNAL_RAY=1; reusing existing Ray cluster."

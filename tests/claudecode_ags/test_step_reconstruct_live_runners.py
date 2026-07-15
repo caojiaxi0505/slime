@@ -238,6 +238,11 @@ def test_live_vanilla_runner_happy_path(tmp_path):
         "problem_statement": "bug",
         "eval_cmd": "true",
         "agent_prompt": "fix",
+        "data_source": "swegym",
+        "base_commit": "abc123",
+        "swe_smith_bug_patch": None,
+        "pre_commands": "",
+        "install_config": {},
     }
 
     adapter = MagicMock()
@@ -279,6 +284,7 @@ def test_live_vanilla_runner_happy_path(tmp_path):
     bundle.save(str(tmp_path))
 
     eval_result = SimpleNamespace(resolved=False, applied_cleanly=True, details={})
+    prepare_workspace = AsyncMock()
 
     async def _run():
         with patch.dict(os.environ, {"STEP_GRPO_BUNDLE_DIR": str(tmp_path)}), patch(
@@ -301,7 +307,7 @@ def test_live_vanilla_runner_happy_path(tmp_path):
             return_value=sandbox_cm,
         ), patch(
             "examples.claudecode_ags.step_reconstruct.live_runners.agent_runtime.prepare_workspace",
-            new_callable=AsyncMock,
+            prepare_workspace,
         ), patch(
             "examples.claudecode_ags.step_reconstruct.live_runners.agent_runtime.install_toolchain",
             new_callable=AsyncMock,
@@ -346,6 +352,17 @@ def test_live_vanilla_runner_happy_path(tmp_path):
     assert solved is False
     assert lps == [[-0.5]]
     adapter.finish_session.assert_awaited()
+    prepare_workspace.assert_awaited_once()
+    kw = prepare_workspace.await_args.kwargs
+    assert kw["workdir"] == "/testbed"
+    assert kw["problem_statement"] == "bug"
+    assert kw["instance_id"] == "inst"
+    assert kw["data_source"] == "swegym"
+    assert kw["base_commit"] == "abc123"
+    assert kw["swe_smith_bug_patch"] is None
+    assert kw["pre_commands"] == ""
+    assert kw["install_config"] == {}
+    assert kw["rollout_side"] is True
 
 
 def test_live_branch_runner_sets_step_group_key(tmp_path):
@@ -452,5 +469,8 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
     assert samples[0].metadata["sample_kind"] == "branch"
     assert samples[0].metadata["step_group_key"] == "3:1:0"
     assert samples[0].metadata["edit_ppl"] == 4.5
-    assert samples[0].loss_mask == [1, 1]
+    assert samples[0].metadata["agent_exit_code"] == 0
+    assert "agent_queue_wait_sec" in samples[0].metadata
+    # Do not force all-1s loss_mask (breaks TIS); fan_out owns the mask.
+    assert samples[0].loss_mask is None
     assert samples[0].rollout_id == 0

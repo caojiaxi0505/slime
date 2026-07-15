@@ -1,0 +1,497 @@
+# Path A hybrid step-GRPO 2-node / 16-GPU hybrid PyTorchJob (Master + Worker).
+# Labels match launch/hybrid_adapter_alb Service selector.
+#
+# Apply via: bash examples/claudecode_ags/launch/hybrid_1node_job/submit_job.sh
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    owner: jiaxicao
+    workload: ${WORKLOAD_LABEL}
+spec:
+  nprocPerNode: "8"
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            app: cc-ags-recorder
+            workload: ${WORKLOAD_LABEL}
+            owner: jiaxicao
+        spec:
+          nodeSelector:
+            group: shennong-5
+            node.kubernetes.io/instance-type: ml.p5e.48xlarge
+            topology.kubernetes.io/zone: ap-southeast-3a
+          tolerations:
+            - key: glm5sft
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          containers:
+            - name: pytorch
+              image: ${IMAGE_URI}
+              imagePullPolicy: Always
+              command: ["bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "=== jiaxicao Path A hybrid step-GRPO 2-node / 16-GPU ==="
+                  echo "RANK=${RANK:-} WORLD_SIZE=${WORLD_SIZE:-} MASTER_ADDR=${MASTER_ADDR:-}"
+                  hostname -I
+                  nvidia-smi -L
+                  git config --global --add safe.directory "${SLIME_DIR}" || true
+                  echo 'source /etc/profile.d/efa.sh' >> /root/.bashrc || true
+                  echo 'source /etc/profile.d/zippy_efa.sh' >> /root/.bashrc || true
+                  sed -i 's|cd /cfs_turbo|cd /|' ~/.bashrc || true
+                  ray stop --force 2>/dev/null || true
+                  cd "${SLIME_DIR}"
+                  export RUN=1
+                  export PHASE="${PHASE:-all}"
+                  bash examples/claudecode_ags/launch/run_hybrid_1node_debug.sh
+                  echo "=== training finished; sleeping for log inspection ==="
+                  sleep 1h
+              env:
+                - name: SLIME_DIR
+                  value: ${SLIME_DIR}
+                - name: HF_CHECKPOINT
+                  value: ${HF_CHECKPOINT}
+                - name: REF_MODEL_PATH
+                  value: ${REF_MODEL_PATH}
+                - name: PROMPT_DATA
+                  value: ${PROMPT_DATA}
+                - name: EVAL_DATA
+                  value: ${EVAL_DATA}
+                - name: EXP_TAG
+                  value: ${EXP_TAG}
+                - name: LOG_DIR
+                  value: ${LOG_DIR}
+                - name: PHASE
+                  value: ${PHASE}
+                - name: WANDB_KEY
+                  value: ${WANDB_KEY}
+                - name: WANDB_PROJECT
+                  value: ${WANDB_PROJECT}
+                - name: WANDB_GROUP
+                  value: ${WANDB_GROUP}
+                - name: WANDB_TEAM
+                  value: ${WANDB_TEAM}
+                - name: SLIME_ADAPTER_PUBLIC_URL
+                  value: ${SLIME_ADAPTER_PUBLIC_URL}
+                - name: ANTHROPIC_BASE_URL
+                  value: ${SLIME_ADAPTER_PUBLIC_URL}
+                - name: SLIME_ADAPTER_PORT
+                  value: "9002"
+                - name: SHIM_PORT
+                  value: "9002"
+                - name: SHIM_BIND_HOST
+                  value: "0.0.0.0"
+                - name: SLIME_ADAPTER_BIND_HOST
+                  value: "0.0.0.0"
+                - name: ACTOR_NUM_NODES
+                  value: "${ACTOR_NUM_NODES}"
+                - name: ACTOR_NUM_GPUS_PER_NODE
+                  value: "8"
+                - name: ROLLOUT_NUM_GPUS
+                  value: "${ROLLOUT_NUM_GPUS}"
+                - name: TP_SIZE
+                  value: "1"
+                - name: PP_SIZE
+                  value: "1"
+                - name: CP_SIZE
+                  value: "8"
+                - name: ROLLOUT_BATCH_SIZE
+                  value: "${ROLLOUT_BATCH_SIZE}"
+                - name: N_SAMPLES_PER_PROMPT
+                  value: "1"
+                - name: GLOBAL_BATCH_SIZE
+                  value: "${GLOBAL_BATCH_SIZE}"
+                - name: NUM_ROLLOUT
+                  value: "${NUM_ROLLOUT}"
+                - name: SAVE_INTERVAL
+                  value: "${SAVE_INTERVAL}"
+                - name: STEP_GRPO_HYBRID_K
+                  value: "${STEP_GRPO_HYBRID_K}"
+                - name: STEP_GRPO_BRANCH_SUBMIT_BATCH
+                  value: "${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
+                - name: STEP_GRPO_BRANCH_CONCURRENCY
+                  value: "${STEP_GRPO_BRANCH_CONCURRENCY}"
+                - name: STEP_GRPO_PPL_CLIP
+                  value: "${STEP_GRPO_PPL_CLIP}"
+                - name: STEP_GRPO_FILTER
+                  value: "${STEP_GRPO_FILTER}"
+                - name: STEP_GRPO_BUNDLE_DIR
+                  value: ${STEP_GRPO_BUNDLE_DIR}
+                - name: NNODES
+                  value: "${ACTOR_NUM_NODES}"
+                - name: USE_EXTERNAL_RAY
+                  value: "0"
+                - name: SLIME_AGENT_SANDBOX_BACKEND
+                  value: ags
+                - name: SLIME_AGENT_AGS_SECRET_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: ${AGS_SECRET_NAME}
+                      key: AGS_SECRET_ID
+                - name: SLIME_AGENT_AGS_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: ${AGS_SECRET_NAME}
+                      key: AGS_SECRET_KEY
+                # Separate AGS tool from vanilla GRPO (sdt-exb9o2gb). Override via submit.
+                - name: SLIME_AGENT_AGS_TOOL_ID
+                  value: ${SLIME_AGENT_AGS_TOOL_ID}
+                - name: SLIME_AGENT_AGS_MOUNT_NAME
+                  value: "rex"
+                - name: SLIME_AGENT_AGS_MOUNT_IMAGE
+                  value: "swebenchdocker.tencentcloudcr.com/swebench/swehub:swerex-runtime"
+                - name: SLIME_AGENT_AGS_MOUNT_IMAGE_REGISTRY_TYPE
+                  value: "enterprise"
+                - name: SLIME_AGENT_AGS_MOUNT_PATH
+                  value: "/nix"
+                - name: SLIME_AGENT_AGS_IMAGE_SUBPATH
+                  value: "/nix"
+                - name: SLIME_AGENT_AGS_REGION
+                  value: "ap-guangzhou"
+                - name: SLIME_AGENT_AGS_DOMAIN
+                  value: "ap-guangzhou.tencentags.com"
+                - name: SLIME_AGENT_AGS_ROLE_ARN
+                  value: "qcs::cam::uin/100034032793:roleName/AGS_cam"
+                - name: SLIME_AGENT_AGS_HTTP_ENDPOINT
+                  value: "ags.tencentcloudapi.com"
+                - name: SLIME_AGENT_TOOLCHAIN_MODE
+                  value: "cos"
+                - name: SLIME_AGENT_COS_MOUNT
+                  value: "/mnt/code_agent"
+                - name: SLIME_AGENT_COS_NODE_PACKAGE
+                  value: "node-v20.18.1-linux-x64.tar.xz"
+                - name: SLIME_AGENT_COS_CC_PACKAGE
+                  value: "cc-prefix-2.1.104-linux-x64.tar.gz"
+                - name: SLIME_CC_TIME_BUDGET_SEC
+                  value: "2700"
+                - name: SLIME_CC_EVAL_TIMEOUT_SEC
+                  value: "600"
+                - name: STEP_GRPO_BRANCH_BUDGET_SEC
+                  value: "2700"
+                - name: SLIME_CC_AGENT_CONCURRENCY
+                  value: "64"
+                - name: SLIME_AGENT_AGS_TIMEOUT
+                  value: "75m"
+                - name: SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC
+                  value: "4500"
+                - name: SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC
+                  value: "600"
+                - name: PATH
+                  value: /root/miniconda3/envs/agent-lightning/bin:/root/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                - name: NCCL_SOCKET_IFNAME
+                  value: "^lo"
+                - name: FI_PROVIDER
+                  value: efa
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+                - name: NCCL_DEBUG
+                  value: WARN
+              ports:
+                - containerPort: 6379
+                  name: gcs-server
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+                - containerPort: 8000
+                  name: serve
+                - containerPort: 9002
+                  name: recorder
+              resources:
+                requests:
+                  cpu: "180"
+                  memory: 1800Gi
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "32"
+                limits:
+                  cpu: "192"
+                  memory: 2000Gi
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "32"
+              volumeMounts:
+                - name: shmem
+                  mountPath: /dev/shm
+                - name: local
+                  mountPath: /local
+                - name: local-cache
+                  mountPath: /root/.cache
+                - name: inst-nvme
+                  mountPath: /ckpt-path
+                - name: preload-nvme
+                  mountPath: /opt/dlami/nvme/preload
+                - name: fsx-storage
+                  mountPath: /mnt/sn-007
+                - name: fsx-storage
+                  mountPath: /mnt/fsx-c
+          volumes:
+            - name: shmem
+              hostPath:
+                path: /dev/shm
+            - name: local
+              hostPath:
+                path: /mnt/k8s-disks/0
+            - name: local-cache
+              hostPath:
+                path: /opt/dlami/nvme/.cache
+            - name: inst-nvme
+              hostPath:
+                path: /opt/dlami/nvme/checkpoints/
+            - name: preload-nvme
+              hostPath:
+                path: /opt/dlami/nvme/preload
+                type: DirectoryOrCreate
+            - name: fsx-storage
+              persistentVolumeClaim:
+                claimName: youtu-sn2-007
+    Worker:
+      replicas: ${WORKER_REPLICAS}
+      restartPolicy: Never
+      template:
+        metadata:
+          labels:
+            workload: ${WORKLOAD_LABEL}
+            owner: jiaxicao
+            role: worker
+        spec:
+          nodeSelector:
+            group: shennong-5
+            node.kubernetes.io/instance-type: ml.p5e.48xlarge
+            topology.kubernetes.io/zone: ap-southeast-3a
+          tolerations:
+            - key: glm5sft
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          containers:
+            - name: pytorch
+              image: ${IMAGE_URI}
+              imagePullPolicy: Always
+              command: ["bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "=== jiaxicao Path A hybrid step-GRPO 2-node / 16-GPU ==="
+                  echo "RANK=${RANK:-} WORLD_SIZE=${WORLD_SIZE:-} MASTER_ADDR=${MASTER_ADDR:-}"
+                  hostname -I
+                  nvidia-smi -L
+                  git config --global --add safe.directory "${SLIME_DIR}" || true
+                  echo 'source /etc/profile.d/efa.sh' >> /root/.bashrc || true
+                  echo 'source /etc/profile.d/zippy_efa.sh' >> /root/.bashrc || true
+                  sed -i 's|cd /cfs_turbo|cd /|' ~/.bashrc || true
+                  ray stop --force 2>/dev/null || true
+                  cd "${SLIME_DIR}"
+                  export RUN=1
+                  export PHASE="${PHASE:-all}"
+                  bash examples/claudecode_ags/launch/run_hybrid_1node_debug.sh
+                  echo "=== training finished; sleeping for log inspection ==="
+                  sleep 1h
+              env:
+                - name: SLIME_DIR
+                  value: ${SLIME_DIR}
+                - name: HF_CHECKPOINT
+                  value: ${HF_CHECKPOINT}
+                - name: REF_MODEL_PATH
+                  value: ${REF_MODEL_PATH}
+                - name: PROMPT_DATA
+                  value: ${PROMPT_DATA}
+                - name: EVAL_DATA
+                  value: ${EVAL_DATA}
+                - name: EXP_TAG
+                  value: ${EXP_TAG}
+                - name: LOG_DIR
+                  value: ${LOG_DIR}
+                - name: PHASE
+                  value: ${PHASE}
+                - name: WANDB_KEY
+                  value: ${WANDB_KEY}
+                - name: WANDB_PROJECT
+                  value: ${WANDB_PROJECT}
+                - name: WANDB_GROUP
+                  value: ${WANDB_GROUP}
+                - name: WANDB_TEAM
+                  value: ${WANDB_TEAM}
+                - name: SLIME_ADAPTER_PUBLIC_URL
+                  value: ${SLIME_ADAPTER_PUBLIC_URL}
+                - name: ANTHROPIC_BASE_URL
+                  value: ${SLIME_ADAPTER_PUBLIC_URL}
+                - name: SLIME_ADAPTER_PORT
+                  value: "9002"
+                - name: SHIM_PORT
+                  value: "9002"
+                - name: SHIM_BIND_HOST
+                  value: "0.0.0.0"
+                - name: SLIME_ADAPTER_BIND_HOST
+                  value: "0.0.0.0"
+                - name: ACTOR_NUM_NODES
+                  value: "${ACTOR_NUM_NODES}"
+                - name: ACTOR_NUM_GPUS_PER_NODE
+                  value: "8"
+                - name: ROLLOUT_NUM_GPUS
+                  value: "${ROLLOUT_NUM_GPUS}"
+                - name: TP_SIZE
+                  value: "1"
+                - name: PP_SIZE
+                  value: "1"
+                - name: CP_SIZE
+                  value: "8"
+                - name: ROLLOUT_BATCH_SIZE
+                  value: "${ROLLOUT_BATCH_SIZE}"
+                - name: N_SAMPLES_PER_PROMPT
+                  value: "1"
+                - name: GLOBAL_BATCH_SIZE
+                  value: "${GLOBAL_BATCH_SIZE}"
+                - name: NUM_ROLLOUT
+                  value: "${NUM_ROLLOUT}"
+                - name: SAVE_INTERVAL
+                  value: "${SAVE_INTERVAL}"
+                - name: STEP_GRPO_HYBRID_K
+                  value: "${STEP_GRPO_HYBRID_K}"
+                - name: STEP_GRPO_BRANCH_SUBMIT_BATCH
+                  value: "${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
+                - name: STEP_GRPO_BRANCH_CONCURRENCY
+                  value: "${STEP_GRPO_BRANCH_CONCURRENCY}"
+                - name: STEP_GRPO_PPL_CLIP
+                  value: "${STEP_GRPO_PPL_CLIP}"
+                - name: STEP_GRPO_FILTER
+                  value: "${STEP_GRPO_FILTER}"
+                - name: STEP_GRPO_BUNDLE_DIR
+                  value: ${STEP_GRPO_BUNDLE_DIR}
+                - name: NNODES
+                  value: "${ACTOR_NUM_NODES}"
+                - name: USE_EXTERNAL_RAY
+                  value: "0"
+                - name: SLIME_AGENT_SANDBOX_BACKEND
+                  value: ags
+                - name: SLIME_AGENT_AGS_SECRET_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: ${AGS_SECRET_NAME}
+                      key: AGS_SECRET_ID
+                - name: SLIME_AGENT_AGS_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: ${AGS_SECRET_NAME}
+                      key: AGS_SECRET_KEY
+                # Separate AGS tool from vanilla GRPO (sdt-exb9o2gb). Override via submit.
+                - name: SLIME_AGENT_AGS_TOOL_ID
+                  value: ${SLIME_AGENT_AGS_TOOL_ID}
+                - name: SLIME_AGENT_AGS_MOUNT_NAME
+                  value: "rex"
+                - name: SLIME_AGENT_AGS_MOUNT_IMAGE
+                  value: "swebenchdocker.tencentcloudcr.com/swebench/swehub:swerex-runtime"
+                - name: SLIME_AGENT_AGS_MOUNT_IMAGE_REGISTRY_TYPE
+                  value: "enterprise"
+                - name: SLIME_AGENT_AGS_MOUNT_PATH
+                  value: "/nix"
+                - name: SLIME_AGENT_AGS_IMAGE_SUBPATH
+                  value: "/nix"
+                - name: SLIME_AGENT_AGS_REGION
+                  value: "ap-guangzhou"
+                - name: SLIME_AGENT_AGS_DOMAIN
+                  value: "ap-guangzhou.tencentags.com"
+                - name: SLIME_AGENT_AGS_ROLE_ARN
+                  value: "qcs::cam::uin/100034032793:roleName/AGS_cam"
+                - name: SLIME_AGENT_AGS_HTTP_ENDPOINT
+                  value: "ags.tencentcloudapi.com"
+                - name: SLIME_AGENT_TOOLCHAIN_MODE
+                  value: "cos"
+                - name: SLIME_AGENT_COS_MOUNT
+                  value: "/mnt/code_agent"
+                - name: SLIME_AGENT_COS_NODE_PACKAGE
+                  value: "node-v20.18.1-linux-x64.tar.xz"
+                - name: SLIME_AGENT_COS_CC_PACKAGE
+                  value: "cc-prefix-2.1.104-linux-x64.tar.gz"
+                - name: SLIME_CC_TIME_BUDGET_SEC
+                  value: "2700"
+                - name: SLIME_CC_EVAL_TIMEOUT_SEC
+                  value: "600"
+                - name: STEP_GRPO_BRANCH_BUDGET_SEC
+                  value: "2700"
+                - name: SLIME_CC_AGENT_CONCURRENCY
+                  value: "64"
+                - name: SLIME_AGENT_AGS_TIMEOUT
+                  value: "75m"
+                - name: SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC
+                  value: "4500"
+                - name: SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC
+                  value: "600"
+                - name: PATH
+                  value: /root/miniconda3/envs/agent-lightning/bin:/root/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                - name: NCCL_SOCKET_IFNAME
+                  value: "^lo"
+                - name: FI_PROVIDER
+                  value: efa
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+                - name: NCCL_DEBUG
+                  value: WARN
+              ports:
+                - containerPort: 6379
+                  name: gcs-server
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+                - containerPort: 8000
+                  name: serve
+                - containerPort: 9002
+                  name: recorder
+              resources:
+                requests:
+                  cpu: "180"
+                  memory: 1800Gi
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "32"
+                limits:
+                  cpu: "192"
+                  memory: 2000Gi
+                  nvidia.com/gpu: "8"
+                  vpc.amazonaws.com/efa: "32"
+              volumeMounts:
+                - name: shmem
+                  mountPath: /dev/shm
+                - name: local
+                  mountPath: /local
+                - name: local-cache
+                  mountPath: /root/.cache
+                - name: inst-nvme
+                  mountPath: /ckpt-path
+                - name: preload-nvme
+                  mountPath: /opt/dlami/nvme/preload
+                - name: fsx-storage
+                  mountPath: /mnt/sn-007
+                - name: fsx-storage
+                  mountPath: /mnt/fsx-c
+          volumes:
+            - name: shmem
+              hostPath:
+                path: /dev/shm
+            - name: local
+              hostPath:
+                path: /mnt/k8s-disks/0
+            - name: local-cache
+              hostPath:
+                path: /opt/dlami/nvme/.cache
+            - name: inst-nvme
+              hostPath:
+                path: /opt/dlami/nvme/checkpoints/
+            - name: preload-nvme
+              hostPath:
+                path: /opt/dlami/nvme/preload
+                type: DirectoryOrCreate
+            - name: fsx-storage
+              persistentVolumeClaim:
+                claimName: youtu-sn2-007

@@ -71,15 +71,25 @@ def _step_group_key(sample: Sample) -> Any:
 
 
 def _branch_key(sample: Sample) -> Any:
+    """Episode identity for summing segment rewards / std filter.
+
+    Hybrid siblings share one ``rollout_id`` (slime compact-rollout). Do **not**
+    use that as the episode key for vanilla trials, or all K attempts collapse
+    into one reward and every group looks ``std0``. Prefer ``branch_uid``, then
+    vanilla ``trial_idx``, then index / session — never shared rollout_id alone.
+    """
     md = sample.metadata or {}
     if md.get("branch_uid") is not None:
         return md["branch_uid"]
-    if sample.rollout_id is not None:
-        return sample.rollout_id
+    if md.get("sample_kind") == "vanilla" and md.get("trial_idx") is not None:
+        gi = sample.group_index if sample.group_index is not None else sample.index
+        return f"v:{gi}:t{md['trial_idx']}"
     if sample.index is not None:
         return sample.index
     if sample.session_id:
         return sample.session_id
+    if sample.rollout_id is not None:
+        return sample.rollout_id
     return id(sample)
 
 

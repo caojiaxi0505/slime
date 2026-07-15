@@ -5,14 +5,28 @@ from examples.claudecode_ags.step_reconstruct.step_grpo_advantage import filter,
 from slime.utils.types import Sample
 
 
-def _s(*, group_index, index, reward, kind, step_group_key=None, loss_mask=None, trial_idx=0):
+def _s(
+    *,
+    group_index,
+    index,
+    reward,
+    kind,
+    step_group_key=None,
+    loss_mask=None,
+    trial_idx=0,
+    rollout_id=None,
+    branch_uid=None,
+):
     md = {"sample_kind": kind, "trial_idx": trial_idx}
     if step_group_key is not None:
         md["step_group_key"] = step_group_key
+    if branch_uid is not None:
+        md["branch_uid"] = branch_uid
     return Sample(
         group_index=group_index,
         index=index,
-        rollout_id=index,
+        # Production hybrid stamps one shared rollout_id on all siblings.
+        rollout_id=rollout_id if rollout_id is not None else index,
         reward=reward,
         prompt="p",
         metadata=md,
@@ -39,6 +53,37 @@ def test_vanilla_and_branch_groups():
     assert adv[2] == -0.5
     assert adv[3] == 0.5
     assert adv[4] == -0.5
+
+
+def test_shared_rollout_id_does_not_collapse_vanilla_trials():
+    """Regression: hybrid siblings share rollout_id but K trials must stay distinct."""
+    shared_rid = 42
+    samples = [
+        _s(
+            group_index=0,
+            index=10,
+            reward=1.0,
+            kind="vanilla",
+            trial_idx=0,
+            rollout_id=shared_rid,
+        ),
+        _s(
+            group_index=0,
+            index=11,
+            reward=0.0,
+            kind="vanilla",
+            trial_idx=1,
+            rollout_id=shared_rid,
+        ),
+    ]
+    args = SimpleNamespace(advantage_estimator="grpo", reward_key=None)
+    os.environ["STEP_GRPO_STD_NORMALIZATION"] = "0"
+    os.environ["STEP_GRPO_FILTER"] = "1"
+    _, adv = post_process_rewards(args, samples)
+    assert adv[0] == 0.5
+    assert adv[1] == -0.5
+    filter(args, samples)
+    assert not any(getattr(s, "remove_sample", False) for s in samples)
 
 
 def test_filter_std_zero():

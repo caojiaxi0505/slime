@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="${SCRIPT_DIR}/pytorchjob.yaml.template"
-INGRESS_NAME="${INGRESS_NAME:-jiaxicao-hybrid-1node-debug-adapter}"
+INGRESS_NAME="${INGRESS_NAME:-${JOB_NAME}-adapter}"
 
 usage() {
   cat <<'EOF'
@@ -59,6 +59,7 @@ done
 
 K8S_NAMESPACE="${K8S_NAMESPACE:-sn5-system-intern}"
 JOB_NAME="${JOB_NAME:-jiaxicao-hybrid-1node-debug}"
+WORKLOAD_LABEL="${WORKLOAD_LABEL:-${JOB_NAME}}"
 IMAGE_URI="${IMAGE_URI:-085995317762.dkr.ecr.ap-southeast-3.amazonaws.com/youtu-agent:slime-nightly-dev-20260530a-efa-swe-mooncake}"
 SLIME_DIR="${SLIME_DIR:-/mnt/sn-007/jiaxicao/code/slime/.worktrees/cc-ags-swe}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/sn-007/jiaxicao/huggingface/models/Qwen/Qwen3.5-9B}"
@@ -151,7 +152,7 @@ if [[ "${LOG_DIR}" == */qwen35_9b_cc_ags_1node_hybrid && "${ALLOW_RESUME:-0}" !=
   exit 4
 fi
 
-export JOB_NAME K8S_NAMESPACE IMAGE_URI SLIME_DIR HF_CHECKPOINT REF_MODEL_PATH
+export JOB_NAME WORKLOAD_LABEL K8S_NAMESPACE IMAGE_URI SLIME_DIR HF_CHECKPOINT REF_MODEL_PATH
 export PROMPT_DATA EVAL_DATA EXP_TAG LOG_DIR PHASE AGS_SECRET_NAME SLIME_ADAPTER_PUBLIC_URL
 export SLIME_AGENT_AGS_TOOL_ID
 export WANDB_KEY WANDB_PROJECT WANDB_GROUP WANDB_TEAM
@@ -159,7 +160,7 @@ export STEP_GRPO_HYBRID_K STEP_GRPO_BRANCH_SUBMIT_BATCH STEP_GRPO_BRANCH_CONCURR
 export STEP_GRPO_BUNDLE_DIR NUM_ROLLOUT SAVE_INTERVAL GLOBAL_BATCH_SIZE ROLLOUT_BATCH_SIZE
 
 RENDERED="$(mktemp)"
-envsubst '${JOB_NAME} ${K8S_NAMESPACE} ${IMAGE_URI} ${SLIME_DIR} ${HF_CHECKPOINT} ${REF_MODEL_PATH} ${PROMPT_DATA} ${EVAL_DATA} ${EXP_TAG} ${LOG_DIR} ${PHASE} ${AGS_SECRET_NAME} ${SLIME_ADAPTER_PUBLIC_URL} ${SLIME_AGENT_AGS_TOOL_ID} ${WANDB_KEY} ${WANDB_PROJECT} ${WANDB_GROUP} ${WANDB_TEAM} ${STEP_GRPO_HYBRID_K} ${STEP_GRPO_BRANCH_SUBMIT_BATCH} ${STEP_GRPO_BRANCH_CONCURRENCY} ${STEP_GRPO_PPL_CLIP} ${STEP_GRPO_FILTER} ${STEP_GRPO_BUNDLE_DIR} ${NUM_ROLLOUT} ${SAVE_INTERVAL} ${GLOBAL_BATCH_SIZE} ${ROLLOUT_BATCH_SIZE}' \
+envsubst '${JOB_NAME} ${WORKLOAD_LABEL} ${K8S_NAMESPACE} ${IMAGE_URI} ${SLIME_DIR} ${HF_CHECKPOINT} ${REF_MODEL_PATH} ${PROMPT_DATA} ${EVAL_DATA} ${EXP_TAG} ${LOG_DIR} ${PHASE} ${AGS_SECRET_NAME} ${SLIME_ADAPTER_PUBLIC_URL} ${SLIME_AGENT_AGS_TOOL_ID} ${WANDB_KEY} ${WANDB_PROJECT} ${WANDB_GROUP} ${WANDB_TEAM} ${STEP_GRPO_HYBRID_K} ${STEP_GRPO_BRANCH_SUBMIT_BATCH} ${STEP_GRPO_BRANCH_CONCURRENCY} ${STEP_GRPO_PPL_CLIP} ${STEP_GRPO_FILTER} ${STEP_GRPO_BUNDLE_DIR} ${NUM_ROLLOUT} ${SAVE_INTERVAL} ${GLOBAL_BATCH_SIZE} ${ROLLOUT_BATCH_SIZE}' \
   < "${TEMPLATE}" > "${RENDERED}"
 
 echo "==> job ${JOB_NAME} in ${K8S_NAMESPACE}"
@@ -185,7 +186,7 @@ rm -f "${RENDERED}"
 echo
 echo "Watch:"
 echo "  kubectl -n ${K8S_NAMESPACE} get pytorchjob ${JOB_NAME} -w"
-echo "  kubectl -n ${K8S_NAMESPACE} get pods -l workload=jiaxicao-hybrid-1node-debug -w"
+echo "  kubectl -n ${K8S_NAMESPACE} get pods -l workload=${WORKLOAD_LABEL} -w"
 echo "  kubectl -n ${K8S_NAMESPACE} logs -f job/${JOB_NAME}-master-0 2>/dev/null || \\"
 echo "    kubectl -n ${K8S_NAMESPACE} logs -f -l training.kubeflow.org/job-name=${JOB_NAME},training.kubeflow.org/replica-type=master"
 echo "ALB /health (after adapter up):"
