@@ -38,11 +38,14 @@ Stage-2 的分叉点选择、token-exact resume、branch advantage、branch 权�
 | 数据状态 | `global_dataset_state_dict_14.pt` |
 | 生效范围 | rollout step 15–24 |
 | Stage-2 loss scope | `first_turn` |
-| W&B 接续点 | `hy9ro2?_step=59`，即原曲线 `rollout/step=14` 的最后一条日志 |
-| W&B 新 run id | 提交后回填 |
+| W&B 接续方式 | 将 `hy9ro2` 的内部历史 0–59 行原样写入新 run，再用 `resume=must` 追加 |
+| W&B 新 run id | [`w17gn551`](https://wandb.ai/models-tencent7723/coding-rl/runs/w17gn551) |
 
 该 run 同时启用 `H-S1-ABORT-1`、`H-S1-STD0-1` 和 `H-S2-SCOPE-1`。因此它是从旧 iter14
 开始采用新逻辑的续训线，不是只改变 Stage-2 mask 的单变量消融。
+
+W&B 账号未开通 `fork_from` 预览功能，因此没有直接调用服务端 fork。新 run 已核验包含连续的
+内部 step 0–59，覆盖 `rollout/step=0–14`；训练从内部 step 60 开始追加，不会改写旧 run。
 
 ## 3. 旧 run 实际少了什么
 
