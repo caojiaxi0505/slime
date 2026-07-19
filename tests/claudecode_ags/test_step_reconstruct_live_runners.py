@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import io
 import json
 import os
@@ -18,9 +19,12 @@ from examples.claudecode_ags.step_reconstruct import live_runners
 from examples.claudecode_ags.step_reconstruct.session_capture import (
     SessionBundle,
     build_hook_steps_from_snap_dir,
+    capture_snapshots_to_bundle,
+    install_snapshot_hook,
     pull_remote_dir,
     steps_from_diff_files,
 )
+from slime.agent.adapters.anthropic_segmented import canonical_sha256, prompt_ids_sha256
 from slime.utils.types import Sample
 
 
@@ -90,6 +94,153 @@ def test_pull_remote_dir_extracts(tmp_path):
     assert (tmp_path / ".cagent_snapshots" / "step_0001.diff").is_file()
 
 
+def test_capture_bundle_persists_real_transcript_and_initial_state(tmp_path):
+    snap = tmp_path / ".cagent_snapshots"
+    snap.mkdir()
+    (snap / "step_0001.diff").write_text("diff --git a/a b/a\n+x\n")
+    (snap / "step_0001.payload.json").write_text(json.dumps({"tool_use_id": "toolu_a"}))
+    (snap / "index.jsonl").write_text(
+        json.dumps({"seq": 1, "source": "hook", "tool_name": "Edit"}) + "\n"
+    )
+    transcript = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "id": "toolu_a"}]},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [{"type": "tool_result", "tool_use_id": "toolu_a"}]
+                    },
+                }
+            ),
+        ]
+    ) + "\n"
+    sb = _FakeSB(files={"/testbed/.harness/trajectory.jsonl": transcript})
+
+    async def fake_pull(*args, **kwargs):
+        return str(snap)
+
+    with patch(
+        "examples.claudecode_ags.step_reconstruct.session_capture.pull_remote_dir",
+        new=fake_pull,
+    ):
+        bundle = asyncio.run(
+            capture_snapshots_to_bundle(
+                sb,
+                out_dir=str(tmp_path),
+                workdir="/testbed",
+                instance_id="inst",
+                session_id="sid",
+                task_metadata={"workdir": "/testbed"},
+                initial_diff="",
+                final_diff="diff --git a/a b/a\n+x\n",
+                claude_exit_code=0,
+            )
+        )
+
+    assert bundle.transcript_valid is True
+    assert bundle.transcript_bytes == len(transcript.encode())
+    assert bundle.transcript_tool_uses == 1
+    assert bundle.transcript_tool_results == 1
+    assert bundle.initial_state_captured is True
+    assert bundle.initial_diff() == ""
+    assert bundle.transcript() == transcript
+
+
+def test_capture_bundle_persists_checkpoint_native_session_and_metadata(tmp_path):
+    out_dir = tmp_path / "bundle"
+    snap = tmp_path / "snap-source"
+    snap.mkdir()
+    (snap / "step_0001.diff").write_text("diff --git a/a b/a\n+x\n")
+    (snap / "step_0001.payload.json").write_text(json.dumps({"tool_use_id": "toolu_a"}))
+    (snap / "step_0001.metadata.json").write_text('{"version":1,"records":[]}')
+    (snap / "initial.metadata.json").write_text('{"version":1,"records":[]}')
+    (snap / "index.jsonl").write_text(
+        json.dumps({"seq": 1, "source": "hook", "tool_name": "Edit"}) + "\n"
+    )
+    projects = tmp_path / "projects"
+    native_project = projects / "-testbed"
+    native_project.mkdir(parents=True)
+    native_text = json.dumps({"type": "user", "uuid": "u", "sessionId": "cc-native"}) + "\n"
+    (native_project / "cc-native.jsonl").write_text(native_text)
+    transcript = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "id": "toolu_a"}]},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_a"}]},
+                }
+            ),
+        ]
+    ) + "\n"
+    checkpoint = {
+        "checkpoint_id": "main-0-checkpoint",
+        "prompt_ids": [1, 2, 3],
+        "prompt_sha256": prompt_ids_sha256([1, 2, 3]),
+        "chat_messages": [{"role": "user", "content": "fix"}],
+        "tools_schema": None,
+        "tools_sha256": canonical_sha256(None),
+        "generation_config": {},
+        "tokenizer_fingerprint": {},
+        "chain_kind": "main",
+        "request_kind": "new",
+        "request_index": 0,
+        "source_tool_use_ids": [],
+        "source_tool_result_ids": [],
+        "generated_tool_use_ids": ["toolu_a"],
+        "generated_tool_use_names": {"toolu_a": "Read"},
+    }
+
+    async def fake_pull(_sb, remote_dir, _local_parent):
+        return str(projects if remote_dir.endswith("/projects") else snap)
+
+    with patch(
+        "examples.claudecode_ags.step_reconstruct.session_capture.pull_remote_dir",
+        new=fake_pull,
+    ):
+        bundle = asyncio.run(
+            capture_snapshots_to_bundle(
+                _FakeSB(),
+                out_dir=str(out_dir),
+                workdir="/testbed",
+                instance_id="inst",
+                session_id="adapter-session",
+                task_metadata={"workdir": "/testbed"},
+                initial_diff="",
+                final_diff="diff --git a/a b/a\n+x\n",
+                transcript_text=transcript,
+                claude_exit_code=0,
+                cc_session_id="cc-native",
+                prompt_checkpoints=[checkpoint],
+            )
+        )
+
+    assert bundle.prompt_checkpoints_valid is True
+    assert bundle.native_session_valid is True
+    assert bundle.workspace_metadata_valid is True
+    assert bundle.checkpoint_for_tool_use_id("toolu_a")["checkpoint_id"] == "main-0-checkpoint"
+    assert bundle.native_session() == native_text
+
+
+def test_snapshot_hook_captures_success_and_failure_boundaries():
+    sb = _FakeSB()
+    asyncio.run(install_snapshot_hook(sb, "/testbed"))
+    settings = json.loads(sb.files["/home/agent/.claude/settings.json"])
+    assert "PostToolUse" in settings["hooks"]
+    assert "PostToolUseFailure" in settings["hooks"]
+
+
 def test_run_claude_with_prefix_cmd():
     from examples.claudecode_ags import agent_runtime
 
@@ -99,12 +250,13 @@ def test_run_claude_with_prefix_cmd():
         seen["cmd"] = start_cmd
         return 0
 
+    sb = _FakeSB(files={"/testbed/.harness/trajectory.jsonl": '{"type":"result"}\n'})
+
     with patch.object(agent_runtime, "run_agent", new=fake_run_agent):
         ec = asyncio.run(
             agent_runtime.run_claude_with_prefix(
-                object(),
+                sb,
                 workdir="/testbed",
-                prompt="fix me",
                 env={"A": "1"},
                 time_budget_sec=10,
                 prefix_path="/tmp/cc_prefix.jsonl",
@@ -113,6 +265,45 @@ def test_run_claude_with_prefix_cmd():
     assert ec["exit_code"] == 0
     assert "--input-format stream-json" in seen["cmd"]
     assert "/tmp/cc_prefix.jsonl" in seen["cmd"]
+    assert "fix me" not in seen["cmd"]
+    assert ec["trajectory_jsonl"] == '{"type":"result"}\n'
+
+
+def test_run_claude_native_resume_uses_documented_resume_and_fork_flags():
+    from examples.claudecode_ags import agent_runtime
+
+    seen = {}
+
+    async def fake_run_agent(sb, *, workdir, start_cmd, env, time_budget_sec):
+        seen["cmd"] = start_cmd
+        return 0
+
+    sb = _FakeSB(files={"/testbed/.harness/trajectory.jsonl": '{"type":"result"}\n'})
+    native = json.dumps(
+        {
+            "type": "assistant",
+            "uuid": "terminal",
+            "sessionId": "cc-session",
+            "message": {"role": "assistant", "content": "done"},
+        }
+    ) + "\n"
+    with patch.object(agent_runtime, "run_agent", new=fake_run_agent):
+        result = asyncio.run(
+            agent_runtime.run_claude_native_resume(
+                sb,
+                workdir="/testbed",
+                env={"A": "1"},
+                time_budget_sec=10,
+                session_jsonl=native,
+            )
+        )
+    assert "--resume /tmp/slime_cc_branch.session.jsonl" in seen["cmd"]
+    assert "--fork-session" in seen["cmd"]
+    assert "--resume-session-at" not in seen["cmd"]
+    assert "__SLIME_TOKEN_EXACT_RESUME_HANDSHAKE__" in sb.files[
+        "/tmp/slime_cc_resume_handshake.jsonl"
+    ]
+    assert result["trajectory_jsonl"] == '{"type":"result"}\n'
 
 
 def test_collect_aligned_turn_logprobs_joins_by_tool_use_id():
@@ -156,14 +347,60 @@ def test_hybrid_defaults_to_live_runners():
         called["v"] += 1
         d = tempfile.mkdtemp()
         steps = steps_from_diff_files(d, ["", "diff --git a/a b/a\n+1\n"])
+        metadata_payload = '{"version":1,"records":[],"unsupported_paths":[]}'
+        with open(os.path.join(d, ".cagent_snapshots", "initial.metadata.json"), "w") as f:
+            f.write(metadata_payload)
+        for i, step in enumerate(steps):
+            step.tool_use_id = f"toolu_{i}"
+            step.metadata_file = os.path.join(
+                ".cagent_snapshots", f"step_{i:04d}.metadata.json"
+            )
+            with open(os.path.join(d, step.metadata_file), "w") as f:
+                f.write(metadata_payload)
         b = SessionBundle(
             instance_id="x",
             session_id="s",
             cc_session_id="",
             task_metadata={"image": "img", "workdir": "/testbed"},
             steps=steps,
+            prompt_checkpoints_valid=True,
+            native_session_valid=True,
+            workspace_metadata_valid=True,
             dir=d,
         )
+        events = []
+        for i in range(len(steps)):
+            tool_id = f"toolu_{i}"
+            events.extend(
+                [
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [{"type": "tool_use", "id": tool_id}],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": [{"type": "tool_result", "tool_use_id": tool_id}],
+                        },
+                    },
+                ]
+            )
+        with open(os.path.join(d, "transcript.jsonl"), "w", encoding="utf-8") as f:
+            f.write("\n".join(json.dumps(event) for event in events) + "\n")
+        with gzip.open(os.path.join(d, "prompt_checkpoints.json.gz"), "wt", encoding="utf-8") as f:
+            json.dump(
+                [
+                    {
+                        "generated_tool_use_ids": ["toolu_1"],
+                        "generated_tool_use_names": {"toolu_1": "Edit"},
+                        "chain_kind": "main",
+                        "request_kind": "new",
+                    }
+                ],
+                f,
+            )
         b.save(d)
         s = Sample(prompt="p", index=0, group_index=0, reward=0.0, metadata={})
         return b, [s], False, [[], [-5.0]]
@@ -217,6 +454,33 @@ def test_hybrid_stamps_shared_rollout_id_on_mixed_siblings():
     assert [s.rollout_id for s in out] == [3, 3]
 
 
+def test_turn_alignment_failure_disables_only_stage2(tmp_path):
+    steps = steps_from_diff_files(str(tmp_path), [""])
+    steps[0].tool_use_id = "toolu_missing"
+    bundle = SessionBundle(
+        instance_id="inst",
+        session_id="sid",
+        cc_session_id="",
+        task_metadata={"workdir": "/testbed"},
+        steps=steps,
+        transcript_valid=True,
+        dir=str(tmp_path),
+    )
+    bundle.save(str(tmp_path))
+
+    aligned = live_runners._collect_stage2_alignment_or_disable(
+        SimpleNamespace(store={}),
+        "sid",
+        bundle,
+    )
+
+    assert aligned == [[]]
+    assert bundle.transcript_valid is False
+    assert "missing_turn_for_steps" in bundle.transcript_error
+    persisted = SessionBundle.load(str(tmp_path))
+    assert persisted.transcript_valid is False
+
+
 def test_live_vanilla_runner_happy_path(tmp_path):
     sample = Sample(
         prompt="p",
@@ -247,6 +511,7 @@ def test_live_vanilla_runner_happy_path(tmp_path):
 
     adapter = MagicMock()
     adapter.open_session = MagicMock()
+    adapter.export_prompt_checkpoints_async = AsyncMock(return_value=[{"checkpoint_id": "cp"}])
     turn = SimpleNamespace(output_log_probs=[-0.5])
     adapter.store = {
         "ccags-inst-0-0": SimpleNamespace(
@@ -285,6 +550,7 @@ def test_live_vanilla_runner_happy_path(tmp_path):
 
     eval_result = SimpleNamespace(resolved=False, applied_cleanly=True, details={})
     prepare_workspace = AsyncMock()
+    capture_bundle = AsyncMock(return_value=bundle)
 
     async def _run():
         with patch.dict(os.environ, {"STEP_GRPO_BUNDLE_DIR": str(tmp_path)}), patch(
@@ -317,15 +583,14 @@ def test_live_vanilla_runner_happy_path(tmp_path):
         ), patch(
             "examples.claudecode_ags.step_reconstruct.live_runners.agent_runtime.run_claude",
             new_callable=AsyncMock,
-            return_value={"exit_code": 0},
+            return_value={"exit_code": 0, "trajectory_jsonl": '{"type":"result"}\n'},
         ), patch(
             "examples.claudecode_ags.step_reconstruct.live_runners._common.workspace_diff",
             new_callable=AsyncMock,
             return_value="diff --git a/a b/a\n+1\n",
         ), patch(
             "examples.claudecode_ags.step_reconstruct.live_runners.capture_snapshots_to_bundle",
-            new_callable=AsyncMock,
-            return_value=bundle,
+            capture_bundle,
         ), patch(
             "examples.claudecode_ags.step_reconstruct.live_runners.gen._evaluate_diff",
             new_callable=AsyncMock,
@@ -363,12 +628,19 @@ def test_live_vanilla_runner_happy_path(tmp_path):
     assert kw["pre_commands"] == ""
     assert kw["install_config"] == {}
     assert kw["rollout_side"] is True
+    capture_kw = capture_bundle.await_args.kwargs
+    assert capture_kw["initial_diff"] == "diff --git a/a b/a\n+1\n"
+    assert capture_kw["transcript_text"] == '{"type":"result"}\n'
+    assert capture_kw["prompt_checkpoints"] == [{"checkpoint_id": "cp"}]
+    assert capture_kw["cc_session_id"]
+    adapter.export_prompt_checkpoints_async.assert_awaited_once_with("ccags-inst-0-0", clear=True)
 
 
 def test_live_branch_runner_sets_step_group_key(tmp_path):
     d = tmp_path / "bundle"
     d.mkdir()
     steps = steps_from_diff_files(str(d), ["diff --git a/a b/a\n+1\n"])
+    steps[0].tool_use_id = "toolu_edit"
     md = {
         "instance_id": "inst",
         "image": "img:latest",
@@ -380,16 +652,115 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
     bundle = SessionBundle(
         instance_id="inst",
         session_id="s",
-        cc_session_id="",
+        cc_session_id="cc-session",
         task_metadata=md,
         steps=steps,
+        cc_session_files=["cc_projects/project/cc-session.jsonl"],
+        prompt_checkpoints_valid=True,
+        native_session_valid=True,
+        workspace_metadata_valid=True,
         dir=str(d),
     )
+    (d / ".cagent_snapshots" / "initial.metadata.json").write_text(
+        '{"version":1,"records":[],"unsupported_paths":[]}'
+    )
     bundle.save(str(d))
-    (d / "transcript.jsonl").write_text('{"type":"tool_result","id":"1"}\n')
+    (d / "transcript.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [{"type": "tool_use", "id": "toolu_edit"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": [{"type": "tool_result", "tool_use_id": "toolu_edit"}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    with gzip.open(d / "prompt_checkpoints.json.gz", "wt", encoding="utf-8") as f:
+        json.dump(
+            [
+                {
+                    "checkpoint_id": "main-0-checkpoint",
+                    "generated_tool_use_ids": ["toolu_edit"],
+                    "generated_tool_use_names": {"toolu_edit": "Edit"},
+                }
+            ],
+            f,
+        )
+    native_dir = d / "cc_projects" / "project"
+    native_dir.mkdir(parents=True)
+    (native_dir / "cc-session.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "native-user",
+                        "parentUuid": None,
+                        "isSidechain": False,
+                        "sessionId": "cc-session",
+                        "cwd": "/testbed",
+                        "version": "2.1.104",
+                        "message": {"role": "user", "content": "fix"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "native-target",
+                        "parentUuid": "native-user",
+                        "isSidechain": False,
+                        "sessionId": "cc-session",
+                        "cwd": "/testbed",
+                        "version": "2.1.104",
+                        "message": {
+                            "id": "native-message",
+                            "content": [{"type": "tool_use", "id": "toolu_edit"}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
 
     adapter = MagicMock()
     adapter.open_session = MagicMock()
+    adapter.open_session_async = AsyncMock()
+    adapter.resume_status = MagicMock(
+        return_value={
+            "mode": "token_exact",
+            "checkpoint_id": "main-0-checkpoint",
+            "prompt_sha256": "abc",
+            "first_prompt_sha256": "abc",
+            "first_prompt_exact": True,
+            "handshake_validated": True,
+            "exact_request_count": 1,
+            "last_stop_reason": "end_turn",
+            "tool_use_echo_mismatch_count": 2,
+            "tool_use_echo_missing_count": 1,
+            "tool_use_echo_payload_mismatch_count": 1,
+            "runtime_tool_schema_mismatch_count": 3,
+            "generated_runtime_tool_unavailable_count": 2,
+            "generated_runtime_tool_input_invalid_count": 6,
+            "max_tokens_continuation_count": 4,
+            "post_end_turn_ack_count": 1,
+            "request_replay_count": 5,
+            "error": "",
+        }
+    )
     adapter.finish_session = AsyncMock(return_value=[{"tokens": [1], "response_length": 1}])
     adapter.shutdown_session = AsyncMock()
     state = SimpleNamespace(
@@ -434,9 +805,15 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
             "examples.claudecode_ags.step_reconstruct.live_runners.agent_runtime.install_toolchain",
             new_callable=AsyncMock,
         ), patch(
-            "examples.claudecode_ags.step_reconstruct.live_runners.resume_and_run",
+            "examples.claudecode_ags.step_reconstruct.live_runners.agent_runtime.ensure_claude_home_writable",
             new_callable=AsyncMock,
-            return_value={"exit_code": 0},
+        ), patch(
+            "examples.claudecode_ags.step_reconstruct.live_runners.install_snapshot_hook",
+            new_callable=AsyncMock,
+        ), patch(
+            "examples.claudecode_ags.step_reconstruct.live_runners.agent_runtime.run_claude_native_resume",
+            new_callable=AsyncMock,
+            return_value={"exit_code": 0, "trajectory_jsonl": '{"type":"result"}\n'},
         ), patch(
             "examples.claudecode_ags.step_reconstruct.live_runners._common.workspace_diff",
             new_callable=AsyncMock,
@@ -458,7 +835,8 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
                 sampling_params={},
                 bundle=bundle,
                 source_trial_idx=1,
-                step_t=0,
+                edit_step_i=0,
+                branch_step_t=-1,
                 branch_idx=2,
                 group_index=3,
                 edit_ppl=4.5,
@@ -467,9 +845,22 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
     samples = asyncio.run(_run())
     assert len(samples) == 1
     assert samples[0].metadata["sample_kind"] == "branch"
-    assert samples[0].metadata["step_group_key"] == "3:1:0"
+    assert samples[0].metadata["step_group_key"] == "3:1:edit:0"
+    assert samples[0].metadata["edit_step_i"] == 0
+    assert samples[0].metadata["branch_step_t"] == -1
     assert samples[0].metadata["edit_ppl"] == 4.5
     assert samples[0].metadata["agent_exit_code"] == 0
+    assert samples[0].metadata["prefix_reseed_mode"] == "native-session-checkpoint"
+    assert samples[0].metadata["tool_use_echo_mismatch_count"] == 2
+    assert samples[0].metadata["tool_use_echo_missing_count"] == 1
+    assert samples[0].metadata["tool_use_echo_payload_mismatch_count"] == 1
+    assert samples[0].metadata["runtime_tool_schema_mismatch_count"] == 3
+    assert samples[0].metadata["generated_runtime_tool_unavailable_count"] == 2
+    assert samples[0].metadata["generated_runtime_tool_input_invalid_count"] == 6
+    assert samples[0].metadata["max_tokens_continuation_count"] == 4
+    assert samples[0].metadata["post_end_turn_ack_count"] == 1
+    assert samples[0].metadata["resume_request_replay_count"] == 5
+    assert samples[0].metadata["resume_last_stop_reason"] == "end_turn"
     assert "agent_queue_wait_sec" in samples[0].metadata
     # Do not force all-1s loss_mask (breaks TIS); fan_out owns the mask.
     assert samples[0].loss_mask is None

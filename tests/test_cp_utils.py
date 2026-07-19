@@ -101,6 +101,65 @@ def test_split_across_mbs_recovers_full_per_rollout_mean():
 
 
 @pytest.mark.unit
+def test_explicit_episode_weights_are_segment_and_length_invariant():
+    """An episode coefficient is applied after its token mean.
+
+    Splitting one episode into compact segments, or giving another episode a
+    different token length, therefore does not change either episode's
+    nominal share of the objective.
+    """
+    total_lengths, response_lengths, loss_masks = _make_inputs([2, 4, 1])
+    sample_denoms = _denoms(6, 6, 1)
+    sample_weights = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
+    reducer = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        sample_denoms,
+        sample_weights=sample_weights,
+    )
+    # Episode A is split into 2+4 tokens, all value 2: 0.5 * mean(A) = 1.
+    # Episode B has one token of value 6:             0.5 * mean(B) = 3.
+    x = torch.tensor([2.0] * 6 + [6.0], requires_grad=True)
+    loss = reducer(x)
+    assert loss.item() == pytest.approx(4.0)
+    loss.backward()
+    assert x.grad[:6].tolist() == pytest.approx([0.5 / 6] * 6)
+    assert x.grad[6].item() == pytest.approx(0.5)
+
+
+@pytest.mark.unit
+def test_explicit_episode_weights_survive_microbatch_split():
+    total_lengths, response_lengths, loss_masks = _make_inputs([2, 4, 1])
+    denoms = _denoms(6, 6, 1)
+    weights = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
+    x = torch.tensor([2.0] * 6 + [6.0])
+
+    whole = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        denoms,
+        sample_weights=weights,
+    )(x)
+    mb_a = get_sum_of_sample_mean(
+        total_lengths[:1],
+        response_lengths[:1],
+        loss_masks[:1],
+        denoms[:1],
+        sample_weights=weights[:1],
+    )(x[:2])
+    mb_b = get_sum_of_sample_mean(
+        total_lengths[1:],
+        response_lengths[1:],
+        loss_masks[1:],
+        denoms[1:],
+        sample_weights=weights[1:],
+    )(x[2:])
+    assert (mb_a + mb_b).item() == pytest.approx(whole.item())
+
+
+@pytest.mark.unit
 def test_split_with_per_mb_denom_would_be_wrong():
     """Sanity-check the bug we're guarding against: if the caller naively
     computes per-rollout denoms from each mb's own samples (the local mask

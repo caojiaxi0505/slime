@@ -1,4 +1,5 @@
 import asyncio
+import json
 from unittest.mock import patch
 
 from slime.agent.harness import common as harness_common
@@ -42,6 +43,18 @@ def test_run_claude_passes_only_provided_env():
         assert launch_envs == [env]
         assert not any(k.startswith("SWE_") for call_env in sb.exec_envs if call_env for k in call_env)
         assert not any(k.startswith("VERL_") for call_env in sb.exec_envs if call_env for k in call_env)
+        initial_input = sb.files["/tmp/slime_cc_initial_prompt.jsonl"]
+        assert json.loads(initial_input) == {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "solve it"}],
+            },
+        }
+        launcher = sb.files["/tmp/.run.sh"]
+        assert "--input-format stream-json" in launcher
+        assert "< /tmp/slime_cc_initial_prompt.jsonl" in launcher
+        assert "solve it" not in launcher
 
     with patch.object(harness_common.asyncio, "sleep", new=_fast_sleep):
         asyncio.run(run_case())

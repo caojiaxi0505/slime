@@ -1,4 +1,6 @@
 import asyncio
+import gzip
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -7,26 +9,103 @@ import pytest
 
 from examples.claudecode_ags.step_reconstruct.hybrid_generate import (
     VanillaTrialResult,
+    _branch_drop_bucket,
     collect_patch_candidates,
     hybrid_generate,
+    pre_checkpoint_snapshot_index,
     select_branch_turns,
 )
 from examples.claudecode_ags.step_reconstruct.session_capture import SessionBundle, steps_from_diff_files
 from slime.utils.types import Sample
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (RuntimeError("expected one echo for tool_use toolu_x, got 0"), "resume_tool_echo"),
+        (RuntimeError("expected one result for tool_use toolu_x, got 0"), "resume_missing_result"),
+        (
+            RuntimeError("received resumed request without pending tool calls after stop_reason=unknown"),
+            "resume_no_pending",
+        ),
+        (RuntimeError("tool schema differs from the Stage-1 checkpoint"), "resume_tool_schema"),
+        (
+            RuntimeError("tool input incompatible with Claude Code runtime tool schema"),
+            "resume_tool_schema",
+        ),
+        (
+            RuntimeError("Task/Agent subagent dispatch is not supported in a token-exact resumed branch"),
+            "resume_subagent",
+        ),
+        (RuntimeError("token_exact_resume_not_verified"), "resume_other"),
+        (RuntimeError("rebuild apply/verify failed"), "workspace_rebuild"),
+        (TimeoutError(), "timeout"),
+        (RuntimeError("boom"), "other"),
+    ],
+)
+def test_branch_drop_bucket(error, expected):
+    assert _branch_drop_bucket(error) == expected
+
+
 def _bundle(tmp_path, diffs):
     d = tmp_path / "b"
     d.mkdir(parents=True, exist_ok=True)
     steps = steps_from_diff_files(str(d), diffs)
+    tool_ids = [f"toolu_{i}" for i in range(len(steps))]
+    metadata_payload = '{"version":1,"records":[],"unsupported_paths":[]}'
+    snapshots = d / ".cagent_snapshots"
+    (snapshots / "initial.metadata.json").write_text(metadata_payload)
+    for i, (step, tool_id) in enumerate(zip(steps, tool_ids, strict=True)):
+        step.tool_use_id = tool_id
+        metadata_rel = f".cagent_snapshots/step_{i:04d}.metadata.json"
+        (d / metadata_rel).write_text(metadata_payload)
+        step.metadata_file = metadata_rel
     b = SessionBundle(
         instance_id="x",
         session_id="s",
         cc_session_id="",
         task_metadata={"image": "img", "workdir": "/testbed"},
         steps=steps,
+        prompt_checkpoints_valid=True,
+        native_session_valid=True,
+        workspace_metadata_valid=True,
         dir=str(d),
     )
+    events = []
+    for tool_id in tool_ids:
+        events.extend(
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": tool_id, "name": "Read", "input": {}}],
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}],
+                    },
+                },
+            ]
+        )
+    (d / "transcript.jsonl").write_text("\n".join(json.dumps(event) for event in events) + "\n")
+    with gzip.open(d / "prompt_checkpoints.json.gz", "wt", encoding="utf-8") as f:
+        json.dump(
+            [
+                {
+                    "checkpoint_id": f"main-{i}",
+                    "generated_tool_use_ids": [tool_id],
+                    "generated_tool_use_names": {tool_id: "Read"},
+                    "chain_kind": "main",
+                    "request_kind": "new" if i == 0 else "append",
+                }
+                for i, tool_id in enumerate(tool_ids)
+            ],
+            f,
+        )
     b.save(str(d))
     return SessionBundle.load(str(d))
 
@@ -47,7 +126,38 @@ def test_collect_and_select(tmp_path):
     assert len(cands) == 2
     sel = select_branch_turns(trials, k=1)
     assert sel[0].source_trial_idx == 1
-    assert sel[0].step_t == 1
+    assert sel[0].edit_step_i == 1
+    assert sel[0].branch_step_t == 0
+
+
+def test_checkpoint_group_sets_pre_turn_without_transcript_order():
+    # The two tools belong to one model turn but completed in reverse order.
+    assert pre_checkpoint_snapshot_index(
+        ["toolu_previous", "toolu_b", "toolu_a"],
+        ["toolu_a", "toolu_b"],
+        "toolu_a",
+    ) == 0
+
+
+def test_checkpoint_group_rejects_interleaved_unknown_snapshot():
+    with pytest.raises(ValueError, match="not_contiguous"):
+        pre_checkpoint_snapshot_index(
+            ["toolu_a", "toolu_nested", "toolu_b"],
+            ["toolu_a", "toolu_b"],
+            "toolu_a",
+        )
+
+
+def test_invalid_transcript_is_audit_only_for_token_exact_candidate(tmp_path):
+    bundle = _bundle(tmp_path, ["", "diff --git a/a b/a\n+1\n"])
+    bundle.transcript_valid = False
+    bundle.transcript_error = "split parallel stream rows"
+    bundle.save(bundle.dir)
+    candidates = collect_patch_candidates(
+        [VanillaTrialResult(0, bundle, [_sample()], False, [[], [-3.0]])]
+    )
+    assert len(candidates) == 1
+    assert candidates[0].branch_step_t == 0
 
 
 def test_hybrid_all_solved_no_branch(tmp_path):
@@ -75,6 +185,8 @@ def test_hybrid_all_solved_no_branch(tmp_path):
     )
     assert len(out) == 2
     assert all(s.metadata["sample_kind"] == "vanilla" for s in out)
+    assert len({s.loss_group_id for s in out}) == 2
+    assert len({s.rollout_id for s in out}) == 1
 
 
 def test_hybrid_branches_k_times_k(tmp_path):
@@ -92,13 +204,21 @@ def test_hybrid_branches_k_times_k(tmp_path):
     calls = []
 
     async def branch_runner(**kwargs):
-        calls.append((kwargs["source_trial_idx"], kwargs["step_t"], kwargs["branch_idx"]))
+        calls.append(
+            (
+                kwargs["source_trial_idx"],
+                kwargs["edit_step_i"],
+                kwargs["branch_step_t"],
+                kwargs["branch_idx"],
+            )
+        )
         s = _sample(0.0, index=100 + len(calls))
         s.metadata = {
             "sample_kind": "branch",
-            "step_group_key": f"0:{kwargs['source_trial_idx']}:{kwargs['step_t']}",
+            "step_group_key": f"0:{kwargs['source_trial_idx']}:edit:{kwargs['edit_step_i']}",
             "source_trial_idx": kwargs["source_trial_idx"],
-            "step_t": kwargs["step_t"],
+            "edit_step_i": kwargs["edit_step_i"],
+            "branch_step_t": kwargs["branch_step_t"],
             "branch_idx": kwargs["branch_idx"],
             "edit_ppl": kwargs["edit_ppl"],
         }
@@ -118,6 +238,9 @@ def test_hybrid_branches_k_times_k(tmp_path):
     branches = [s for s in out if s.metadata["sample_kind"] == "branch"]
     assert len(branches) == 4
     assert len(calls) == 4
+    # Six independent episodes, still one outer scheduling rollout.
+    assert len({s.loss_group_id for s in out}) == 6
+    assert len({s.rollout_id for s in out}) == 1
 
 
 def test_hybrid_all_trials_fail_returns_abort_sample():

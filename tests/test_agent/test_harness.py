@@ -94,6 +94,8 @@ def test_run_agent_times_out_when_marker_never_appears():
         with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
             rc = await hc.run_agent(sb, workdir="/w", start_cmd="x", env={}, time_budget_sec=0)
         assert rc == sandbox_mod.EXIT_TIME_BUDGET_EXCEEDED
+        assert _find(sb.exec_log, "kill -TERM -- -$pid")
+        assert _find(sb.exec_log, "kill -KILL -- -$pid")
 
     asyncio.run(run_case())
 
