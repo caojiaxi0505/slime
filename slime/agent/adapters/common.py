@@ -157,6 +157,9 @@ class BaseAdapter:
         self.inflight: dict[str, set[asyncio.Task]] = {}
         self.closed: set[str] = set()
         self.app = web.Application(client_max_size=64 * 1024 * 1024)
+        self._sglang_http_session: aiohttp.ClientSession | None = None
+        self._sglang_http_loop: asyncio.AbstractEventLoop | None = None
+        self.app.on_cleanup.append(self._cleanup_http_resources)
 
         # one manager shared across all sids; per-sid trees live inside it.
         # fork_threshold_tokens left None means the manager uses its own default.
@@ -173,6 +176,9 @@ class BaseAdapter:
         self.app.router.add_get("/healthz", _health)
         self.app.router.add_get("/v1/models", _health)
         self._register_routes(self.app)
+
+    async def _cleanup_http_resources(self, _: web.Application) -> None:
+        await close_sglang_client(self)
 
     # -- wire hooks (subclass overrides) -------------------------------------
 
@@ -470,9 +476,9 @@ async def call_sglang_generate(
     sglang_url = adapter.sglang_url
     rid = uuid.uuid4().hex
     headers = {"X-SMG-Routing-Key": session_id} if session_id and session_id != "default" else None
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+    sess = _sglang_client(adapter)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
+        async with sess.post(
             f"{sglang_url}/generate",
             json={
                 "rid": rid,
@@ -504,8 +510,13 @@ async def call_sglang_generate(
         # orphaned generation keeps occupying KV until its own length cap
         logger.debug("[%s] sid=%s rid=%s turn aborted: %s", adapter.log_prefix, session_id, rid, type(e).__name__)
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
-                await s2.post(f"{sglang_url}/abort_request", json={"rid": rid})
+            abort_session = _sglang_client(adapter)
+            async with abort_session.post(
+                f"{sglang_url}/abort_request",
+                json={"rid": rid},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ):
+                pass
         except Exception:
             pass
         raise
@@ -516,6 +527,38 @@ async def call_sglang_generate(
         finish_reason=finish,
         output_log_probs=output_log_probs,
     )
+
+
+def _sglang_client(adapter: Any) -> aiohttp.ClientSession:
+    """Return one SGLang HTTP client bound to the adapter event loop.
+
+    Creating a ``ClientSession`` for every turn discards keep-alive connections
+    and adds avoidable socket/TLS bookkeeping to the hot path.  The adapter is
+    served by one event loop, so a lazily-created loop-bound client is safe to
+    share across concurrent sessions.
+    """
+    loop = asyncio.get_running_loop()
+    session = getattr(adapter, "_sglang_http_session", None)
+    owner_loop = getattr(adapter, "_sglang_http_loop", None)
+    if session is not None and not session.closed:
+        if owner_loop is not loop:
+            raise RuntimeError("SGLang ClientSession used from a different event loop")
+        return session
+
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+    session = aiohttp.ClientSession(timeout=timeout)
+    adapter._sglang_http_session = session
+    adapter._sglang_http_loop = loop
+    return session
+
+
+async def close_sglang_client(adapter: Any) -> None:
+    """Close the adapter-owned keep-alive client, if one was created."""
+    session = getattr(adapter, "_sglang_http_session", None)
+    adapter._sglang_http_session = None
+    adapter._sglang_http_loop = None
+    if session is not None and not session.closed:
+        await session.close()
 
 
 async def _health(request: web.Request) -> web.Response:

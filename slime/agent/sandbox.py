@@ -105,6 +105,7 @@ async def exec_and_wait(
     """
     out_file = out_file or f"/tmp/.{tag}.out"
     done_file = f"/tmp/.{tag}.done"
+    pid_file = f"/tmp/.{tag}.pid"
     launcher = f"/tmp/.{tag}.sh"
     lock_dir = f"/tmp/.{tag}.spawned"
     prefix = f"cd {workdir}\nexport HOME=/home/{user}\n" if workdir else ""
@@ -114,8 +115,9 @@ async def exec_and_wait(
     await sb.exec(
         f"chmod +x {launcher}; "
         f"mkdir {lock_dir} 2>/dev/null || exit 0; "
-        f"rm -f {out_file} {done_file}; "
-        f"setsid bash {launcher} < /dev/null > {out_file} 2>&1 &",
+        f"rm -f {out_file} {done_file} {pid_file}; "
+        f"setsid bash {launcher} < /dev/null > {out_file} 2>&1 & "
+        f"echo $! > {pid_file}",
         user=user,
         env=env,
         timeout=30,
@@ -123,6 +125,23 @@ async def exec_and_wait(
         idempotent=True,
     )
     exit_code = await _await_done_marker(sb, done_file, user=user, time_budget_sec=time_budget_sec)
+    if exit_code == EXIT_TIME_BUDGET_EXCEEDED:
+        # Merely stopping the marker poll leaves the detached agent alive.  It
+        # can continue issuing adapter/SGLang requests after its rollout has
+        # returned, racing cache flush and inference-memory offload.  Terminate
+        # the whole setsid process group before handing control back.
+        await sb.exec(
+            f"if test -s {pid_file}; then "
+            f"pid=$(cat {pid_file}); "
+            f"kill -TERM -- -$pid 2>/dev/null || true; "
+            f"sleep 2; "
+            f"kill -KILL -- -$pid 2>/dev/null || true; "
+            f"fi",
+            user=user,
+            timeout=15,
+            check=False,
+            idempotent=True,
+        )
     if exit_code == 0 and not want_output:
         return exit_code, ""
     if want_output:

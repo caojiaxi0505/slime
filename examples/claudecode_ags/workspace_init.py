@@ -18,6 +18,7 @@ _SCRIPT = "/tmp/slime_ws_init.sh"
 _PATCH = "/tmp/slime_ws_patch.diff"
 _SCRUB_MARKER = "slime_git_scrub"
 _SCRUB_EVAL_MARKER = "slime_git_scrub_eval"
+_SCRUB_COMMIT_DATE = "2000-01-01T00:00:00+0000"
 _ESP_IDF_EXAMPLES = "/workspace/esp-idf/examples"
 _HUNK_RE = re.compile(r"@@ -(\d+(?:,\d+)?) \+(\d+(?:,\d+)?) @@(.*)")
 
@@ -123,7 +124,11 @@ if [ -d {wd}/.git ]; then
             done
         git checkout --orphan __slime_buggy 2>/dev/null || true
         git -c user.email=slime@local -c user.name=slime add -A 2>/dev/null || true
-        git -c user.email=slime@local -c user.name=slime \\
+        # Claude Code exposes this synthetic commit in its system prompt. Fix
+        # both Git timestamps so identical trees produce identical prompt text.
+        GIT_AUTHOR_DATE={shlex.quote(_SCRUB_COMMIT_DATE)} \\
+        GIT_COMMITTER_DATE={shlex.quote(_SCRUB_COMMIT_DATE)} \\
+        git -c user.email=slime@local -c user.name=slime -c commit.gpgSign=false \\
             commit --allow-empty -q -m 'slime initial bug state' 2>/dev/null || true
         git reflog expire --expire=now --all 2>/dev/null || true
         git gc --prune=now --aggressive >/dev/null 2>&1 || true

@@ -195,9 +195,17 @@ def _request_session_id(request: web.Request) -> str:
     return sid_from_bearer(request) or (request.headers.get("X-Api-Key") or "").strip() or "default"
 
 
-def _render_response(body: dict, blocks: list[dict], stop_reason: str, in_tok: int, out_tok: int) -> dict:
+def _render_response(
+    body: dict,
+    blocks: list[dict],
+    stop_reason: str,
+    in_tok: int,
+    out_tok: int,
+    *,
+    message_id: str | None = None,
+) -> dict:
     return {
-        "id": f"msg_{secrets.token_hex(12)}",
+        "id": message_id or f"msg_{secrets.token_hex(12)}",
         "type": "message",
         "role": "assistant",
         "model": body.get("model", "slime-actor"),
@@ -208,7 +216,15 @@ def _render_response(body: dict, blocks: list[dict], stop_reason: str, in_tok: i
     }
 
 
-async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.StreamResponse:
+async def _render_stream(
+    request,
+    blocks,
+    stop_reason,
+    in_tok,
+    out_tok,
+    *,
+    message_id: str | None = None,
+) -> web.StreamResponse:
     """Stream blocks back as an Anthropic Messages SSE response: message_start,
     (content_block_start, content_block_delta, content_block_stop)*N,
     message_delta, message_stop."""
@@ -225,7 +241,7 @@ async def _render_stream(request, blocks, stop_reason, in_tok, out_tok) -> web.S
     ms_data = {
         "type": "message_start",
         "message": {
-            "id": f"msg_{secrets.token_hex(12)}",
+            "id": message_id or f"msg_{secrets.token_hex(12)}",
             "type": "message",
             "role": "assistant",
             "model": "slime-actor",

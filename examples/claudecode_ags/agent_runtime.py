@@ -8,6 +8,7 @@ from pathlib import Path
 
 from slime.agent.harness.common import install_npm_cli, run_agent
 
+from examples.claudecode_ags.claude_stream_input import initial_prompt_jsonl
 from examples.claudecode_ags.workspace_init import TaskFields, initialize_task_workspace
 
 CLAUDE_BIN = "/usr/local/bin/claude"
@@ -22,6 +23,9 @@ _DEFAULT_COS_NODE_PACKAGE = "node-v20.18.1-linux-x64.tar.xz"
 _DEFAULT_COS_CC_PACKAGE = "cc-prefix-2.1.104-linux-x64.tar.gz"
 _DEFAULT_COS_NODE_DIR = "/opt/node-cos"
 _DEFAULT_COS_CC_DIR = "/opt/cc-cos"
+_INITIAL_PROMPT_PATH = "/tmp/slime_cc_initial_prompt.jsonl"
+_RESUME_HANDSHAKE_PATH = "/tmp/slime_cc_resume_handshake.jsonl"
+_RESUME_HANDSHAKE = "__SLIME_TOKEN_EXACT_RESUME_HANDSHAKE__"
 
 
 async def prepare_workspace(
@@ -122,6 +126,16 @@ async def install_toolchain(sb) -> None:
     raise ValueError(f"Unknown SLIME_AGENT_TOOLCHAIN_MODE: {mode!r}")
 
 
+async def ensure_claude_home_writable(sb) -> None:
+    """Create Claude Code state directories with ownership matching its user."""
+    await sb.exec(
+        "mkdir -p /home/agent/.claude/projects && chown -R agent:agent /home/agent/.claude",
+        user="root",
+        timeout=60,
+        check=True,
+    )
+
+
 async def run_claude(
     sb,
     *,
@@ -129,36 +143,41 @@ async def run_claude(
     prompt: str,
     env: dict[str, str],
     time_budget_sec: int,
+    claude_session_id: str | None = None,
 ) -> dict:
-    """Run ``claude -p`` with exactly the caller-provided ``env`` dict."""
-    cmd = f"{CLAUDE_BIN} -p {shlex.quote(prompt)} {CLAUDE_FLAGS}"
-    exit_code = await run_agent(
+    """Start a new task through the same stream-json path used by Stage-2."""
+    await sb.write_file(
+        _INITIAL_PROMPT_PATH,
+        initial_prompt_jsonl(prompt),
+        user="agent",
+    )
+    return await run_claude_with_prefix(
         sb,
         workdir=workdir,
-        start_cmd=cmd,
         env=env,
         time_budget_sec=time_budget_sec,
+        prefix_path=_INITIAL_PROMPT_PATH,
+        claude_session_id=claude_session_id,
     )
-    return {"exit_code": exit_code}
 
 
 async def run_claude_with_prefix(
     sb,
     *,
     workdir: str,
-    prompt: str,
     env: dict[str, str],
     time_budget_sec: int,
     prefix_path: str,
+    claude_session_id: str | None = None,
 ) -> dict:
-    """Prefix re-seed: feed stream-json transcript then continue with ``-p``.
+    """Run Claude Code from canonical stream-json input events.
 
-    Uses ``--input-format stream-json`` so Claude Code warms history from
-    ``prefix_path`` before taking the next turn (Stage-2 bridge).
+    A one-event file starts a new task; a longer prefix warms history before
+    taking the next turn for the Stage-2 bridge.
     """
+    session_flag = f"--session-id {shlex.quote(claude_session_id)} " if claude_session_id else ""
     cmd = (
-        f"{CLAUDE_BIN} -p {shlex.quote(prompt)} "
-        f"--input-format stream-json {CLAUDE_FLAGS} "
+        f"{CLAUDE_BIN} -p {session_flag}--input-format stream-json {CLAUDE_FLAGS} "
         f"< {shlex.quote(prefix_path)}"
     )
     exit_code = await run_agent(
@@ -168,13 +187,62 @@ async def run_claude_with_prefix(
         env=env,
         time_budget_sec=time_budget_sec,
     )
-    return {"exit_code": exit_code}
+    trajectory_path = f"{workdir}/.harness/trajectory.jsonl"
+    trajectory = await sb.read_file(trajectory_path, user="agent")
+    return {
+        "exit_code": exit_code,
+        "trajectory_path": trajectory_path,
+        "trajectory_jsonl": str(trajectory or ""),
+    }
+
+
+async def run_claude_native_resume(
+    sb,
+    *,
+    workdir: str,
+    env: dict[str, str],
+    time_budget_sec: int,
+    session_jsonl: str,
+    session_path: str = "/tmp/slime_cc_branch.session.jsonl",
+) -> dict:
+    """Fork a truncated native Claude Code session and trigger one handshake.
+
+    The handshake is intentionally not model context: the token-exact adapter
+    ignores bootstrap system/messages and substitutes the saved checkpoint.
+    """
+    if not (session_jsonl or "").strip():
+        raise RuntimeError("native Claude Code session prefix is empty")
+    await sb.write_file(session_path, session_jsonl, user="agent")
+    await sb.write_file(
+        _RESUME_HANDSHAKE_PATH,
+        initial_prompt_jsonl(_RESUME_HANDSHAKE),
+        user="agent",
+    )
+    cmd = (
+        f"{CLAUDE_BIN} -p --resume {shlex.quote(session_path)} --fork-session "
+        f"--input-format stream-json {CLAUDE_FLAGS} < {shlex.quote(_RESUME_HANDSHAKE_PATH)}"
+    )
+    exit_code = await run_agent(
+        sb,
+        workdir=workdir,
+        start_cmd=cmd,
+        env=env,
+        time_budget_sec=time_budget_sec,
+    )
+    trajectory_path = f"{workdir}/.harness/trajectory.jsonl"
+    trajectory = await sb.read_file(trajectory_path, user="agent")
+    return {
+        "exit_code": exit_code,
+        "trajectory_path": trajectory_path,
+        "trajectory_jsonl": str(trajectory or ""),
+        "native_resume_path": session_path,
+    }
 
 
 async def git_diff(sb, *, workdir: str) -> str:
     cmd = (
         f"cd {workdir} && git add -N . && "
-        "git diff -- . ':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/'"
+        "git diff -- . ':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/**'"
     )
     _, out, _ = await sb.exec(cmd, user="agent", timeout=120)
     return out
