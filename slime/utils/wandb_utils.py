@@ -97,12 +97,15 @@ def _compute_config_for_logging(args):
         "STEP_GRPO_HYBRID_K",
         "STEP_GRPO_FILTER",
         "STEP_GRPO_BRANCH_LOSS_WEIGHT",
+        "STEP_GRPO_STAGE2_LOSS_SCOPE",
     ]
     output["env_vars"] = {k: v for k, v in os.environ.items() if k in whitelist_env_vars}
     if os.environ.get("STEP_GRPO_HYBRID_K") is not None:
         output["step_grpo/hybrid_k"] = int(os.environ["STEP_GRPO_HYBRID_K"])
     if os.environ.get("STEP_GRPO_BRANCH_LOSS_WEIGHT") is not None:
         output["step_grpo/branch_loss_weight"] = float(os.environ["STEP_GRPO_BRANCH_LOSS_WEIGHT"])
+    if os.environ.get("STEP_GRPO_STAGE2_LOSS_SCOPE") is not None:
+        output["step_grpo/stage2_loss_scope"] = os.environ["STEP_GRPO_STAGE2_LOSS_SCOPE"]
 
     if getattr(args, "use_critic", False):
         critic_args = _get_role_args_for_logging(args, role="critic")

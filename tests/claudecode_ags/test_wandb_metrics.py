@@ -362,6 +362,8 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
             "hybrid_stage1_wall_sec": 1.0,
             "transcript_valid": True,
             "agent_queue_wait_sec": 3.0,
+            "hybrid_num_stage1_planned_trials": 8,
+            "hybrid_num_stage1_aborted_placeholders": 2,
             "hybrid_num_patch_candidates": 2,
             "hybrid_num_selected_edits": 1,
             "hybrid_num_branch_tasks": 8,
@@ -408,6 +410,10 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
             "max_tokens_continuation_count": 4,
             "post_end_turn_ack_count": 1,
             "resume_request_replay_count": 5,
+            "stage2_loss_scope": "first_turn",
+            "stage2_pre_scope_trainable_tokens": 7,
+            "stage2_kept_trainable_tokens": 2,
+            "stage2_masked_later_trainable_tokens": 5,
         }
     )
     branch.loss_mask = [1, 0, 1]
@@ -423,7 +429,16 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
     assert m["perf/step_grpo/stage2_active_tokens"] == 2.0
     assert m["perf/step_grpo/stage1_nominal_loss_weight"] == 1.0
     assert m["perf/step_grpo/stage2_nominal_loss_weight"] == 2.0
+    assert m["perf/step_grpo/n_stage2_loss_scope_audited"] == 1.0
+    assert m["perf/step_grpo/n_stage2_first_turn_scoped"] == 1.0
+    assert m["perf/step_grpo/stage2_pre_scope_trainable_tokens"] == 7.0
+    assert m["perf/step_grpo/stage2_kept_trainable_tokens"] == 2.0
+    assert m["perf/step_grpo/stage2_masked_later_trainable_tokens"] == 5.0
+    assert m["perf/step_grpo/stage2_kept_token_rate"] == 2.0 / 7.0
     assert m["perf/step_grpo/branch_loss_weight"] == 2.0
+    assert m["perf/step_grpo/n_stage1_planned_trials"] == 8.0
+    assert m["perf/step_grpo/n_stage1_aborted_placeholders"] == 2.0
+    assert m["perf/step_grpo/stage1_aborted_placeholder_rate"] == 0.25
     assert m["perf/step_grpo/n_patch_candidates"] == 2.0
     assert m["perf/step_grpo/n_branch_tasks"] == 8.0
     assert m["perf/step_grpo/n_dropped_branches"] == 2.0

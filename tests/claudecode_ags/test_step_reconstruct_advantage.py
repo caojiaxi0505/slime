@@ -1,6 +1,8 @@
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from examples.claudecode_ags.step_reconstruct.step_grpo_advantage import filter, post_process_rewards
 from slime.utils.types import Sample
 
@@ -86,10 +88,35 @@ def test_shared_rollout_id_does_not_collapse_vanilla_trials():
     assert not any(getattr(s, "remove_sample", False) for s in samples)
 
 
-def test_filter_std_zero():
+def test_vanilla_std_zero_is_audit_only_like_plain_grpo():
     samples = [
         _s(group_index=0, index=10, reward=1.0, kind="vanilla", trial_idx=0),
         _s(group_index=0, index=11, reward=1.0, kind="vanilla", trial_idx=1),
+    ]
+    os.environ["STEP_GRPO_FILTER"] = "1"
+    filter(SimpleNamespace(), samples)
+    assert not any(s.remove_sample for s in samples)
+    assert [s.loss_weight for s in samples] == [0.5, 0.5]
+
+
+def test_branch_std_zero_is_still_filtered():
+    samples = [
+        _s(
+            group_index=0,
+            index=20,
+            reward=1.0,
+            kind="branch",
+            step_group_key="0:0:edit:2",
+            branch_uid="0:0:edit:2:0",
+        ),
+        _s(
+            group_index=0,
+            index=21,
+            reward=1.0,
+            kind="branch",
+            step_group_key="0:0:edit:2",
+            branch_uid="0:0:edit:2:1",
+        ),
     ]
     os.environ["STEP_GRPO_FILTER"] = "1"
     filter(SimpleNamespace(), samples)
@@ -184,34 +211,45 @@ def test_loss_weights_equalize_episodes_and_edit_groups(monkeypatch):
     assert [s.loss_weight for s in samples[3:]] == [0.5, 0.5, 1.0]
 
 
-def test_zero_token_episode_does_not_occupy_weight_denominator(monkeypatch):
+def test_zero_token_vanilla_slot_keeps_fixed_group_weight(monkeypatch):
     monkeypatch.setenv("STEP_GRPO_FILTER", "0")
     samples = [
         _s(group_index=0, index=10, reward=1.0, kind="vanilla", trial_idx=0, loss_mask=[1]),
         _s(group_index=0, index=11, reward=0.0, kind="vanilla", trial_idx=1, loss_mask=[0]),
     ]
+    samples[1].remove_sample = True
     filter(SimpleNamespace(), samples)
-    assert samples[0].loss_weight == 1.0
-    assert samples[1].loss_weight == 0.0
+    assert samples[0].loss_weight == 0.5
+    assert samples[1].loss_weight == 0.5
 
 
-def test_zero_token_episode_does_not_change_advantage_or_std_filter(monkeypatch):
+def test_zero_token_vanilla_slot_defines_sibling_advantage_like_plain_grpo(monkeypatch):
     args = SimpleNamespace(advantage_estimator="grpo", reward_key=None)
     samples = [
         _s(group_index=0, index=10, reward=1.0, kind="vanilla", trial_idx=0, loss_mask=[1]),
         _s(group_index=0, index=11, reward=0.0, kind="vanilla", trial_idx=1, loss_mask=[0]),
     ]
+    samples[1].remove_sample = True
 
     monkeypatch.setenv("STEP_GRPO_STD_NORMALIZATION", "0")
     monkeypatch.setenv("STEP_GRPO_FILTER", "0")
     _, advantages = post_process_rewards(args, samples)
-    # Only one episode can train, so centering it against itself produces no
-    # GRPO signal. The zero-token sibling must not manufacture a +0.5 signal.
-    assert advantages == [0.0, 0.0]
+    # The placeholder itself has no loss, but its reward=0 remains one member
+    # of the two-trial GRPO group.
+    assert advantages == [0.5, -0.5]
 
     monkeypatch.setenv("STEP_GRPO_FILTER", "1")
     filter(args, samples)
-    # With only one effective episode the prompt group is std-zero and is
-    # removed, exactly as if the zero-token row did not exist.
-    assert all(sample.remove_sample for sample in samples)
-    assert all(sample.loss_weight == 0.0 for sample in samples)
+    assert samples[0].remove_sample is False
+    assert samples[1].remove_sample is True
+    assert [sample.loss_weight for sample in samples] == [0.5, 0.5]
+
+
+def test_declared_stage1_group_size_rejects_missing_slot(monkeypatch):
+    monkeypatch.setenv("STEP_GRPO_FILTER", "0")
+    samples = [
+        _s(group_index=0, index=10, reward=1.0, kind="vanilla", trial_idx=0),
+    ]
+    samples[0].metadata["stage1_group_size"] = 2
+    with pytest.raises(ValueError, match="has 1 episode slots, expected 2"):
+        filter(SimpleNamespace(), samples)

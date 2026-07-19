@@ -118,6 +118,7 @@ export STEP_GRPO_BRANCH_CONCURRENCY="${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
 export STEP_GRPO_PPL_CLIP="${STEP_GRPO_PPL_CLIP:-20}"
 export STEP_GRPO_FILTER="${STEP_GRPO_FILTER:-1}"
 export STEP_GRPO_BRANCH_LOSS_WEIGHT="${STEP_GRPO_BRANCH_LOSS_WEIGHT:-1.0}"
+export STEP_GRPO_STAGE2_LOSS_SCOPE="${STEP_GRPO_STAGE2_LOSS_SCOPE:-full_continuation}"
 
 if [[ "${PHASE}" == "eval" ]]; then
   # train.py: if num_rollout == 0 and eval_interval is set → eval-only.
@@ -141,6 +142,9 @@ fi
 EXP_TAG="${EXP_TAG:-qwen35_9b_cc_ags_1node_hybrid_ltpa}"
 LOG_DIR="${LOG_DIR:-/mnt/sn-007/jiaxicao/checkpoints/cc-ags/${EXP_TAG}}"
 RUN_ROOT="${RUN_ROOT:-${LOG_DIR}}"
+LOAD_PATH="${LOAD_PATH:-${LOG_DIR}/slime_save}"
+SAVE_PATH="${SAVE_PATH:-${LOG_DIR}/slime_save}"
+LOAD_CKPT_STEP="${LOAD_CKPT_STEP:-}"
 export STEP_GRPO_BUNDLE_DIR="${STEP_GRPO_BUNDLE_DIR:-${LOG_DIR}/step_reconstruct_bundles}"
 # Avoid inheriting a stale vanilla-GRPO WANDB_GROUP from slime_ags.env.
 if [[ -z "${WANDB_GROUP:-}" || "${WANDB_GROUP}" == "qwen35_9b_cc_ags_1node_grpo_debug" || "${WANDB_GROUP}" == "qwen35_9b_cc_ags_1node_hybrid" ]]; then
@@ -241,7 +245,7 @@ if [[ "${PHASE}" != "train" && ! -f "${EVAL_DATA}" ]]; then
   exit 1
 fi
 if [[ "${PHASE}" == "eval" ]]; then
-  _save_dir="${LOG_DIR}/slime_save"
+  _save_dir="${LOAD_PATH}"
   if [[ ! -d "${_save_dir}" ]] || [[ -z "$(find "${_save_dir}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
     echo "ERROR: PHASE=eval requires a non-empty checkpoint at ${_save_dir}." >&2
     echo "       Run PHASE=train|all first, or set LOG_DIR to an existing run." >&2
@@ -260,10 +264,17 @@ source "${MODEL_SCRIPT}"
 CKPT_ARGS=(
   --hf-checkpoint "${HF_CHECKPOINT}"
   --ref-load "${REF_MODEL_PATH}"
-  --load "${LOG_DIR}/slime_save"
-  --save "${LOG_DIR}/slime_save"
+  --load "${LOAD_PATH}"
+  --save "${SAVE_PATH}"
   --save-interval "${SAVE_INTERVAL}"
 )
+if [[ -n "${LOAD_CKPT_STEP}" ]]; then
+  if [[ ! "${LOAD_CKPT_STEP}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: LOAD_CKPT_STEP must be a non-negative integer, got: ${LOAD_CKPT_STEP}" >&2
+    exit 2
+  fi
+  CKPT_ARGS+=(--ckpt-step "${LOAD_CKPT_STEP}")
+fi
 
 ROLLOUT_ARGS=(
   --prompt-data "${PROMPT_DATA}"
@@ -294,8 +305,9 @@ ROLLOUT_ARGS=(
   --custom-rollout-log-function-path examples.claudecode_ags.wandb_metrics.log_rollout_data
 )
 
-# This hook always runs because it assigns the explicit loss objective after
-# filtering. STEP_GRPO_FILTER=0 disables only the degenerate-group removal.
+# This hook always runs because it assigns the explicit loss objective.
+# STEP_GRPO_FILTER controls only degenerate Stage-2 group removal; Stage-1
+# follows plain GRPO and keeps zero-variance groups.
 ROLLOUT_ARGS+=(
   --rollout-sample-filter-path examples.claudecode_ags.step_reconstruct.step_grpo_advantage.filter
 )
@@ -473,6 +485,8 @@ echo "======================================================================"
 echo "Path A hybrid step-GRPO (PHASE=${PHASE} RUN=${RUN} nodes=${ACTOR_NUM_NODES})"
 echo "SLIME_DIR=${SLIME_DIR}"
 echo "LOG_DIR=${LOG_DIR}"
+echo "LOAD_PATH=${LOAD_PATH} LOAD_CKPT_STEP=${LOAD_CKPT_STEP:-latest}"
+echo "SAVE_PATH=${SAVE_PATH} RUN_ROOT=${RUN_ROOT}"
 echo "ACTOR_NUM_NODES=${ACTOR_NUM_NODES} GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE}"
 echo "TP=${TP_SIZE} PP=${PP_SIZE} CP=${CP_SIZE} ROLLOUT_GPUS=${ROLLOUT_NUM_GPUS}"
 echo "batch: rollout=${ROLLOUT_BATCH_SIZE} n_samples=${N_SAMPLES_PER_PROMPT} global=${GLOBAL_BATCH_SIZE} num_rollout=${NUM_ROLLOUT}"
@@ -491,7 +505,7 @@ if [[ "${RUN}" != "1" ]]; then
 fi
 
 mkdir -p \
-  "${LOG_DIR}/slime_save" \
+  "${SAVE_PATH}" \
   "${LOG_DIR}/wandb" \
   "${LOG_DIR}/rollout_dumps" \
   "${LOG_DIR}/launcher_logs"
@@ -500,7 +514,8 @@ mkdir -p \
 python3 - "${LOG_DIR}/run_manifest.json" "${EXP_TAG}" "${STEP_GRPO_HYBRID_K}" \
   "${STEP_GRPO_FILTER}" "${STEP_GRPO_BRANCH_LOSS_WEIGHT}" "${ROLLOUT_BATCH_SIZE}" \
   "${GLOBAL_BATCH_SIZE}" "${STEP_GRPO_BUNDLE_DIR}" "${SLIME_CC_TIME_BUDGET_SEC}" \
-  "${STEP_GRPO_BRANCH_BUDGET_SEC}" <<'PY'
+  "${STEP_GRPO_BRANCH_BUDGET_SEC}" "${STEP_GRPO_STAGE2_LOSS_SCOPE}" "${LOAD_PATH}" \
+  "${LOAD_CKPT_STEP}" "${SAVE_PATH}" <<'PY'
 import json
 import os
 import subprocess
@@ -517,6 +532,10 @@ import sys
     bundle_dir,
     stage1_budget,
     branch_budget,
+    stage2_loss_scope,
+    load_path,
+    load_ckpt_step,
+    save_path,
 ) = sys.argv[1:]
 try:
     git_commit = subprocess.check_output(
@@ -525,12 +544,13 @@ try:
 except Exception:
     git_commit = "unknown"
 manifest = {
-    "schema_version": 1,
+    "schema_version": 2,
     "experiment": exp_tag,
     "git_commit": git_commit,
     "objective": "mean_prompt(L_v + lambda * L_b)",
-    "stage1_episode_weighting": "equal_after_filter",
+    "stage1_episode_weighting": "fixed_planned_slots_with_zero_mask_placeholders",
     "stage2_group_weighting": "equal_edit_groups_then_equal_branches_after_filter",
+    "stage2_loss_scope": stage2_loss_scope,
     "step_grpo_hybrid_k": int(hybrid_k),
     "step_grpo_filter": filter_enabled not in {"0", "false", "False"},
     "step_grpo_branch_loss_weight": float(branch_weight),
@@ -539,6 +559,9 @@ manifest = {
     "bundle_dir": bundle_dir,
     "stage1_agent_budget_sec": int(stage1_budget),
     "stage2_agent_budget_sec": int(branch_budget),
+    "load_path": load_path,
+    "load_ckpt_step": int(load_ckpt_step) if load_ckpt_step else None,
+    "save_path": save_path,
 }
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as f:

@@ -409,6 +409,11 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
     resume_request_replays = 0
     resume_request_replay_branches = 0
     resume_hashes: dict[tuple[Any, ...], set[str]] = defaultdict(set)
+    stage2_scope_audited = 0
+    stage2_first_turn_scoped = 0
+    stage2_pre_scope_tokens = 0
+    stage2_kept_tokens = 0
+    stage2_masked_later_tokens = 0
 
     for members in groups.values():
         stage = _sample_kind(members[0])
@@ -422,6 +427,15 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
                 transcript_invalid += int(not bool(validity))
         else:
             md = _meta(members[0])
+            pre_scope_tokens = _safe_float(md.get("stage2_pre_scope_trainable_tokens"))
+            kept_tokens = _safe_float(md.get("stage2_kept_trainable_tokens"))
+            masked_tokens = _safe_float(md.get("stage2_masked_later_trainable_tokens"))
+            if pre_scope_tokens is not None and kept_tokens is not None and masked_tokens is not None:
+                stage2_scope_audited += 1
+                stage2_first_turn_scoped += int(md.get("stage2_loss_scope") == "first_turn")
+                stage2_pre_scope_tokens += int(pre_scope_tokens)
+                stage2_kept_tokens += int(kept_tokens)
+                stage2_masked_later_tokens += int(masked_tokens)
             if "prompt_exact" in md or "prefix_reseed_verified" in md:
                 resume_known += 1
                 resume_verified += int(
@@ -504,6 +518,18 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
     out["perf/step_grpo/branch_loss_weight"] = float(os.environ.get("STEP_GRPO_BRANCH_LOSS_WEIGHT", "1"))
     out["perf/step_grpo/transcript_status_known"] = float(transcript_known)
     out["perf/step_grpo/transcript_invalid_trials"] = float(transcript_invalid)
+    if stage2_scope_audited:
+        out["perf/step_grpo/n_stage2_loss_scope_audited"] = float(stage2_scope_audited)
+        out["perf/step_grpo/n_stage2_first_turn_scoped"] = float(stage2_first_turn_scoped)
+        out["perf/step_grpo/stage2_pre_scope_trainable_tokens"] = float(stage2_pre_scope_tokens)
+        out["perf/step_grpo/stage2_kept_trainable_tokens"] = float(stage2_kept_tokens)
+        out["perf/step_grpo/stage2_masked_later_trainable_tokens"] = float(
+            stage2_masked_later_tokens
+        )
+        if stage2_pre_scope_tokens > 0:
+            out["perf/step_grpo/stage2_kept_token_rate"] = float(stage2_kept_tokens) / float(
+                stage2_pre_scope_tokens
+            )
     if resume_known:
         out["resume/prompt_exact_rate"] = float(resume_verified) / float(resume_known)
         out["resume/n_verified_branches"] = float(resume_verified)
@@ -555,6 +581,8 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
         key = (md.get("instance_id"), getattr(s, "group_index", None))
         prompt_reps.setdefault(key, s)
     for metadata_key, metric_leaf in (
+        ("hybrid_num_stage1_planned_trials", "n_stage1_planned_trials"),
+        ("hybrid_num_stage1_aborted_placeholders", "n_stage1_aborted_placeholders"),
         ("hybrid_num_patch_candidates", "n_patch_candidates"),
         ("hybrid_num_selected_edits", "n_selected_edits"),
         ("hybrid_num_branch_tasks", "n_branch_tasks"),
@@ -573,6 +601,10 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
         known_values = [v for v in values if v is not None]
         if known_values:
             out[f"perf/step_grpo/{metric_leaf}"] = float(sum(known_values))
+    planned_stage1 = out.get("perf/step_grpo/n_stage1_planned_trials")
+    aborted_stage1 = out.get("perf/step_grpo/n_stage1_aborted_placeholders")
+    if planned_stage1 is not None and planned_stage1 > 0 and aborted_stage1 is not None:
+        out["perf/step_grpo/stage1_aborted_placeholder_rate"] = aborted_stage1 / planned_stage1
     planned = out.get("perf/step_grpo/n_branch_tasks")
     dropped = out.get("perf/step_grpo/n_dropped_branches")
     if planned is not None and planned > 0 and dropped is not None:

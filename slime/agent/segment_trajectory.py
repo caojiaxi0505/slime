@@ -117,13 +117,103 @@ def merge_turns(turns: list[TurnRecord], *, metadata: dict[str, Any] | None = No
 
     rollout_log_probs = [logprob if mask else 0.0 for logprob, mask in zip(rollout_log_probs, loss_mask, strict=True)]
 
+    segment_metadata = dict(metadata or {})
+    # Keep the exact model-output boundaries after prompt drift/truncation has
+    # been resolved.  Consumers can then change the training scope without
+    # guessing turn boundaries from runs of 1s in ``loss_mask``.
+    segment_metadata["assistant_output_spans"] = [list(span) for span in output_spans]
+    segment_metadata["assistant_turn_count"] = len(output_spans)
+
     return TokenSegment(
         prompt_ids=prompt_ids,
         response_ids=response_ids,
         loss_mask=loss_mask,
         rollout_log_probs=rollout_log_probs,
-        metadata=dict(metadata or {}),
+        metadata=segment_metadata,
     )
+
+
+def mask_to_first_assistant_turn(segments: list[TokenSegment]) -> tuple[list[TokenSegment], dict[str, int]]:
+    """Keep loss only on the first trainable assistant turn.
+
+    Response tokens, prompts, and metadata remain intact, so the complete
+    continuation is still available for reward and auditing.  Only the loss
+    mask and matching rollout log-probabilities are zeroed after the first
+    assistant output span.
+    """
+    total_trainable = 0
+    assistant_turns = 0
+    first_location: tuple[int, int, int] | None = None
+
+    for segment_idx, segment in enumerate(segments):
+        if len(segment.loss_mask) != len(segment.response_ids):
+            raise ValueError(
+                "segment loss_mask length mismatch: "
+                f"segment={segment_idx} response={len(segment.response_ids)} mask={len(segment.loss_mask)}"
+            )
+        if segment.rollout_log_probs and len(segment.rollout_log_probs) != len(segment.response_ids):
+            raise ValueError(
+                "segment rollout_log_probs length mismatch: "
+                f"segment={segment_idx} response={len(segment.response_ids)} "
+                f"logprobs={len(segment.rollout_log_probs)}"
+            )
+
+        raw_spans = segment.metadata.get("assistant_output_spans")
+        if not isinstance(raw_spans, list):
+            raise ValueError(f"segment {segment_idx} missing assistant_output_spans")
+
+        previous_end = 0
+        for turn_idx, raw_span in enumerate(raw_spans):
+            if not isinstance(raw_span, (list, tuple)) or len(raw_span) != 2:
+                raise ValueError(
+                    f"segment {segment_idx} has invalid assistant span at turn {turn_idx}: {raw_span!r}"
+                )
+            start, end = int(raw_span[0]), int(raw_span[1])
+            if start < previous_end or start < 0 or end < start or end > len(segment.response_ids):
+                raise ValueError(
+                    f"segment {segment_idx} has out-of-range assistant span at turn {turn_idx}: "
+                    f"[{start}, {end}) for response length {len(segment.response_ids)}"
+                )
+            previous_end = end
+            assistant_turns += 1
+            if first_location is None and any(segment.loss_mask[start:end]):
+                first_location = (segment_idx, start, end)
+        total_trainable += sum(int(value) for value in segment.loss_mask)
+
+    if first_location is None:
+        raise ValueError("no trainable assistant turn found in continuation segments")
+
+    scoped: list[TokenSegment] = []
+    kept_trainable = 0
+    for segment_idx, segment in enumerate(segments):
+        new_mask = [0] * len(segment.loss_mask)
+        if segment_idx == first_location[0]:
+            start, end = first_location[1:]
+            new_mask[start:end] = [int(value) for value in segment.loss_mask[start:end]]
+        kept_trainable += sum(new_mask)
+
+        if segment.rollout_log_probs:
+            new_logprobs = [
+                float(logprob) if mask else 0.0
+                for logprob, mask in zip(segment.rollout_log_probs, new_mask, strict=True)
+            ]
+        else:
+            new_logprobs = []
+        scoped.append(
+            dataclasses.replace(
+                segment,
+                loss_mask=new_mask,
+                rollout_log_probs=new_logprobs,
+            )
+        )
+
+    return scoped, {
+        "assistant_turns": assistant_turns,
+        "total_trainable_tokens": total_trainable,
+        "kept_trainable_tokens": kept_trainable,
+        "masked_trainable_tokens": total_trainable - kept_trainable,
+        "first_turn_segment_idx": first_location[0],
+    }
 
 
 def merge_turn_segments(segments: list[TurnSegment]) -> list[TokenSegment]:

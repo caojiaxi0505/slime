@@ -34,7 +34,7 @@ from examples.claudecode_ags.step_reconstruct.workspace_rebuild import (
     rebuilt_workspace,
 )
 from slime.agent.sandbox import make_sandbox
-from slime.agent.segment_trajectory import fan_out_sample_segments
+from slime.agent.segment_trajectory import fan_out_sample_segments, mask_to_first_assistant_turn
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
@@ -46,6 +46,40 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or str(raw).strip() == "":
         return default
     return int(raw)
+
+
+def _stage2_loss_scope() -> str:
+    scope = os.environ.get("STEP_GRPO_STAGE2_LOSS_SCOPE", "full_continuation").strip().lower()
+    if scope not in {"full_continuation", "first_turn"}:
+        raise ValueError(
+            "STEP_GRPO_STAGE2_LOSS_SCOPE must be full_continuation or first_turn, "
+            f"got {scope!r}"
+        )
+    return scope
+
+
+def _scope_stage2_segments(segments):
+    """Apply the configured Stage-2 loss scope without changing the rollout."""
+    scope = _stage2_loss_scope()
+    if scope == "first_turn":
+        scoped, stats = mask_to_first_assistant_turn(segments)
+    else:
+        total = sum(
+            sum(int(value) for value in (getattr(segment, "loss_mask", None) or []))
+            for segment in segments
+        )
+        stats = {
+            "assistant_turns": sum(
+                int((getattr(segment, "metadata", None) or {}).get("assistant_turn_count") or 0)
+                for segment in segments
+            ),
+            "total_trainable_tokens": total,
+            "kept_trainable_tokens": total,
+            "masked_trainable_tokens": 0,
+            "first_turn_segment_idx": -1,
+        }
+        scoped = segments
+    return scoped, {"scope": scope, **stats}
 
 
 def _bundle_root(args: Any) -> str:
@@ -583,6 +617,10 @@ async def live_branch_runner(
             tool_loop_enabled=gen._env_int("SLIME_CC_TOOL_LOOP_PENALTY", 0) > 0,
         )
 
+        # Reward/evaluation still use the complete continuation.  This optional
+        # scope changes only which Stage-2 assistant tokens receive gradients.
+        segments, loss_scope_audit = _scope_stage2_segments(segments)
+
         step_group_key = f"{group_index}:{source_trial_idx}:edit:{edit_step_i}"
         samples = fan_out_sample_segments(
             branch_sample,
@@ -602,6 +640,18 @@ async def live_branch_runner(
                 "step_group_key": step_group_key,
                 "edit_ppl": edit_ppl,
                 "branch_uid": f"{step_group_key}:{branch_idx}",
+                "stage2_loss_scope": loss_scope_audit["scope"],
+                "stage2_assistant_turn_count": loss_scope_audit["assistant_turns"],
+                "stage2_pre_scope_trainable_tokens": loss_scope_audit[
+                    "total_trainable_tokens"
+                ],
+                "stage2_kept_trainable_tokens": loss_scope_audit["kept_trainable_tokens"],
+                "stage2_masked_later_trainable_tokens": loss_scope_audit[
+                    "masked_trainable_tokens"
+                ],
+                "stage2_first_turn_segment_idx": loss_scope_audit[
+                    "first_turn_segment_idx"
+                ],
                 "branch_transcript_rel": branch_transcript_rel,
                 "prefix_reseed_mode": "native-session-checkpoint",
                 "prefix_reseed_verified": True,
@@ -652,20 +702,22 @@ async def live_branch_runner(
                 **f2p_p2p,
             },
         )
-        # Train scope = full continuation of *model* tokens only.
-        # Keep fan_out / merge_turns loss_mask (1 on assistant outputs, 0 on
-        # tool/context tails). Forcing all-1s would train on placeholder
-        # rollout_log_probs=0.0 and break TIS/RS (see notes 2026-07-14).
+        # Keep fan_out / merge_turns masks: context/tool tokens always remain
+        # zero. ``first_turn`` additionally zeros later assistant outputs.
         if not samples:
             raise RuntimeError("branch adapter_session_empty")
         logger.info(
-            "[hybrid-live] branch src=%d edit=%d pre=%d b=%d reward=%.2f segs=%d exit=%s queue=%.1fs agent=%.1fs",
+            "[hybrid-live] branch src=%d edit=%d pre=%d b=%d reward=%.2f segs=%d "
+            "loss_scope=%s kept_tokens=%d/%d exit=%s queue=%.1fs agent=%.1fs",
             source_trial_idx,
             edit_step_i,
             branch_step_t,
             branch_idx,
             float(reward),
             len(samples),
+            loss_scope_audit["scope"],
+            loss_scope_audit["kept_trainable_tokens"],
+            loss_scope_audit["total_trainable_tokens"],
             agent_result.get("exit_code"),
             queue_wait,
             agent_elapsed,

@@ -7,12 +7,15 @@ from slime.utils.wandb_utils import _compute_config_for_logging
 def test_wandb_config_redacts_key_and_records_hybrid_objective(monkeypatch):
     monkeypatch.setenv("STEP_GRPO_HYBRID_K", "8")
     monkeypatch.setenv("STEP_GRPO_BRANCH_LOSS_WEIGHT", "1.5")
+    monkeypatch.setenv("STEP_GRPO_STAGE2_LOSS_SCOPE", "first_turn")
     args = SimpleNamespace(wandb_key="secret-value", use_critic=False)
     config = _compute_config_for_logging(args)
     assert config["wandb_key"] == "<redacted>"
     assert "secret-value" not in repr(config)
     assert config["step_grpo/hybrid_k"] == 8
     assert config["step_grpo/branch_loss_weight"] == 1.5
+    assert config["step_grpo/stage2_loss_scope"] == "first_turn"
+    assert config["env_vars"]["STEP_GRPO_STAGE2_LOSS_SCOPE"] == "first_turn"
 
 
 def test_coding_agent_metrics_use_rollout_step(monkeypatch):

@@ -861,7 +861,41 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
     assert samples[0].metadata["post_end_turn_ack_count"] == 1
     assert samples[0].metadata["resume_request_replay_count"] == 5
     assert samples[0].metadata["resume_last_stop_reason"] == "end_turn"
+    assert samples[0].metadata["stage2_loss_scope"] == "full_continuation"
     assert "agent_queue_wait_sec" in samples[0].metadata
     # Do not force all-1s loss_mask (breaks TIS); fan_out owns the mask.
     assert samples[0].loss_mask is None
     assert samples[0].rollout_id == 0
+
+
+def test_stage2_first_turn_scope_masks_later_outputs(monkeypatch):
+    from slime.agent.segment_trajectory import TokenSegment
+
+    monkeypatch.setenv("STEP_GRPO_STAGE2_LOSS_SCOPE", "first_turn")
+    segments = [
+        TokenSegment(
+            prompt_ids=[1],
+            response_ids=[2, 3, 4, 5],
+            loss_mask=[1, 0, 1, 1],
+            rollout_log_probs=[-0.1, 0.0, -0.2, -0.3],
+            metadata={"assistant_output_spans": [[0, 1], [2, 4]], "assistant_turn_count": 2},
+        )
+    ]
+
+    scoped, audit = live_runners._scope_stage2_segments(segments)
+    assert scoped[0].loss_mask == [1, 0, 0, 0]
+    assert scoped[0].rollout_log_probs == [-0.1, 0.0, 0.0, 0.0]
+    assert audit == {
+        "scope": "first_turn",
+        "assistant_turns": 2,
+        "total_trainable_tokens": 3,
+        "kept_trainable_tokens": 1,
+        "masked_trainable_tokens": 2,
+        "first_turn_segment_idx": 0,
+    }
+
+
+def test_stage2_loss_scope_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("STEP_GRPO_STAGE2_LOSS_SCOPE", "typo")
+    with pytest.raises(ValueError, match="full_continuation or first_turn"):
+        live_runners._stage2_loss_scope()

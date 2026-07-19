@@ -11,6 +11,7 @@ Path A entry::
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 import time
@@ -123,6 +124,46 @@ def _stamp_hybrid_walls(
         if hybrid_stats:
             s.metadata.update(hybrid_stats)
     return samples
+
+
+def _aborted_vanilla_trial(
+    sample: Sample,
+    *,
+    trial_idx: int,
+    base_index: int,
+    group_index: int,
+    stage1_group_size: int,
+    reason: str,
+) -> Sample:
+    """Build the same zero-gradient slot that plain GRPO keeps on failure.
+
+    Stage-1 runners share the outer ``sample``, so the placeholder must be a
+    copy with the same per-trial identity as ``live_runners._trial_sample``.
+    Its zero reward participates in Stage-1 GRPO normalization; the zero mask
+    prevents the failed episode itself from contributing a loss.
+    """
+    aborted = copy.copy(sample)
+    aborted.index = base_index * 4096 + trial_idx
+    aborted.group_index = group_index
+    aborted.rollout_id = _shared_rollout_id(sample)
+    aborted.session_id = None
+    aborted.tokens = [0, 0]
+    aborted.response = ""
+    aborted.response_length = 1
+    aborted.loss_mask = [0]
+    aborted.rollout_log_probs = [0.0]
+    aborted.reward = 0.0
+    aborted.remove_sample = True
+    aborted.status = Sample.Status.ABORTED
+    aborted.metadata = {
+        **(sample.metadata or {}),
+        "abort_reason": reason,
+        "sample_kind": "vanilla",
+        "trial_idx": trial_idx,
+        "branch_uid": f"v:{group_index}:t{trial_idx}",
+        "stage1_group_size": stage1_group_size,
+    }
+    return aborted
 
 
 def _ppl_clip() -> float:
@@ -371,6 +412,8 @@ async def hybrid_generate(
     raw = await asyncio.gather(*trial_tasks, return_exceptions=True)
     stage1_wall = time.time() - t_stage1
     hybrid_stats = {
+        "hybrid_num_stage1_planned_trials": k,
+        "hybrid_num_stage1_aborted_placeholders": 0,
         "hybrid_num_patch_candidates": 0,
         "hybrid_num_selected_edits": 0,
         "hybrid_num_branch_tasks": 0,
@@ -393,14 +436,48 @@ async def hybrid_generate(
             # Strict: never silently degrade to vanilla-only on alignment bugs.
             raise res
         if isinstance(res, Exception):
-            logger.warning("[hybrid] vanilla trial=%d skipped: %s", i, res)
+            reason = f"vanilla_trial_exception:{type(res).__name__}"
+            logger.warning(
+                "[hybrid] vanilla trial=%d replaced by aborted placeholder: %s",
+                i,
+                res,
+            )
+            vanilla_samples.append(
+                _aborted_vanilla_trial(
+                    sample,
+                    trial_idx=i,
+                    base_index=base_index,
+                    group_index=group_index,
+                    stage1_group_size=k,
+                    reason=reason,
+                )
+            )
+            hybrid_stats["hybrid_num_stage1_aborted_placeholders"] += 1
             continue
         bundle, samples, is_solved, turn_lps = res
+        if not samples:
+            logger.warning(
+                "[hybrid] vanilla trial=%d returned no samples; replaced by aborted placeholder",
+                i,
+            )
+            vanilla_samples.append(
+                _aborted_vanilla_trial(
+                    sample,
+                    trial_idx=i,
+                    base_index=base_index,
+                    group_index=group_index,
+                    stage1_group_size=k,
+                    reason="vanilla_trial_empty",
+                )
+            )
+            hybrid_stats["hybrid_num_stage1_aborted_placeholders"] += 1
+            continue
         for s in samples:
             s.metadata = s.metadata or {}
             s.metadata["sample_kind"] = "vanilla"
             s.metadata["trial_idx"] = i
             s.metadata.setdefault("branch_uid", f"v:{group_index}:t{i}")
+            s.metadata["stage1_group_size"] = k
             s.group_index = group_index
         vanilla_samples.extend(samples)
         trials.append(
@@ -426,24 +503,13 @@ async def hybrid_generate(
         )
 
     if not trials:
-        # Match Path A generate._abort shape so Megatron get_batch never sees
-        # empty tokens (pad narrow with prompt_length-1 would go negative).
-        sample.tokens = [0, 0]
-        sample.response = ""
-        sample.response_length = 1
-        sample.loss_mask = [0]
-        sample.rollout_log_probs = [0.0]
-        sample.reward = 0.0
-        sample.remove_sample = True
-        sample.status = Sample.Status.ABORTED
-        sample.metadata = {
-            **(sample.metadata or {}),
-            "abort_reason": "all_vanilla_trials_failed",
-            "sample_kind": "vanilla",
-        }
-        logger.warning("[hybrid] all vanilla trials failed; returning aborted sample")
-        sample.rollout_id = _shared_rollout_id(sample)
-        return _finish([sample])
+        # Keep all K failed trial slots. Collapsing them into one row would
+        # change both the GRPO group cardinality and Hybrid's Stage-1 weights.
+        logger.warning(
+            "[hybrid] all %d vanilla trials failed; returning aborted placeholders",
+            len(vanilla_samples),
+        )
+        return _finish(vanilla_samples)
 
     if all(t.is_solved for t in trials):
         return _finish(vanilla_samples)

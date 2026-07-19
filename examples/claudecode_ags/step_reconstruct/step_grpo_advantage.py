@@ -132,10 +132,11 @@ def _default_loss_group_id(sample: Sample) -> str:
 def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
     """Assign the exact Hybrid objective after filtering.
 
-    For each outer prompt, active Stage-1 episodes sum to weight 1.  Active
-    Stage-2 edit groups sum to ``lambda``; groups are equal-weighted first,
-    then the active branch episodes within each group are equal-weighted.
-    Compact segments inherit the weight of their episode.
+    For each outer prompt, all scheduled Stage-1 episode slots (including an
+    aborted zero-mask placeholder) sum to weight 1. Active Stage-2 edit groups
+    sum to ``lambda``; groups are equal-weighted first, then the active branch
+    episodes within each group are equal-weighted. Compact segments inherit
+    the weight of their episode.
     """
     branch_lambda = _env_float("STEP_GRPO_BRANCH_LOSS_WEIGHT", 1.0)
     episode_members: dict[tuple[Any, str, Any], list[Sample]] = defaultdict(list)
@@ -163,13 +164,12 @@ def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
         lambda: defaultdict(set)
     )
     for key, members in episode_members.items():
-        if not active_episode[key]:
-            continue
         sample = members[0]
         outer = key[0]
         if _is_vanilla(sample):
             vanilla_by_outer[outer].add(key)
-        else:
+            continue
+        if active_episode[key]:
             branch_by_outer_group[outer][_step_group_key(sample)].add(key)
 
     def _set_episode_weight(key: tuple[Any, str, Any], weight: float) -> None:
@@ -181,7 +181,21 @@ def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
             s.metadata = s.metadata or {}
             s.metadata["loss_weight"] = float(weight)
 
-    for keys in vanilla_by_outer.values():
+    for outer, keys in vanilla_by_outer.items():
+        declared_sizes = {
+            int((episode_members[key][0].metadata or {}).get("stage1_group_size"))
+            for key in keys
+            if (episode_members[key][0].metadata or {}).get("stage1_group_size") is not None
+        }
+        if len(declared_sizes) > 1:
+            raise ValueError(
+                f"outer Stage-1 group {outer!r} has inconsistent declared sizes: {declared_sizes}"
+            )
+        if declared_sizes and len(keys) != next(iter(declared_sizes)):
+            raise ValueError(
+                f"outer Stage-1 group {outer!r} has {len(keys)} episode slots, "
+                f"expected {next(iter(declared_sizes))}"
+            )
         weight = 1.0 / len(keys)
         for key in keys:
             _set_episode_weight(key, weight)
@@ -199,12 +213,20 @@ def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
             for key in keys:
                 _set_episode_weight(key, weight)
 
-    active_vanilla_episodes = sum(len(keys) for keys in vanilla_by_outer.values())
+    active_vanilla_episodes = sum(
+        int(active_episode[key]) for keys in vanilla_by_outer.values() for key in keys
+    )
     return active_vanilla_episodes, active_branch_groups, active_branch_episodes
 
 
 def _normalize_positions(
-    flat: list[Sample], positions: list[int], args: Any, use_std: bool, outer_key_fn
+    flat: list[Sample],
+    positions: list[int],
+    args: Any,
+    use_std: bool,
+    outer_key_fn,
+    *,
+    include_zero_token_episodes: bool = False,
 ) -> dict[int, float]:
     groups: dict[Any, list[int]] = defaultdict(list)
     for pos in positions:
@@ -222,20 +244,25 @@ def _normalize_positions(
             ep_reward[bk] = ep_reward.get(bk, 0.0) + float(s.get_reward_value(args))
             ep_active_tokens[bk] += _active_mask_tokens(s)
 
-        # A zero-token episode has no gradient contribution and therefore must
-        # not change the mean/std used by episodes that do train. This matches
-        # the loss-weight denominator assigned later by ``filter``.
-        active = [bk for bk in ep_reward if ep_active_tokens[bk] > 0]
-        rewards = [ep_reward[bk] for bk in active]
+        # Plain fanout GRPO keeps a failed rollout as reward=0/loss_mask=0: it
+        # has no direct gradient, but its reward still defines sibling
+        # advantages. Stage-1 uses that rule; Stage-2 keeps its existing rule
+        # and normalizes only branches that have trainable tokens.
+        eligible = (
+            list(ep_reward)
+            if include_zero_token_episodes
+            else [bk for bk in ep_reward if ep_active_tokens[bk] > 0]
+        )
+        rewards = [ep_reward[bk] for bk in eligible]
         adv_map: dict[Any, float] = {}
         if rewards:
             mean = statistics.fmean(rewards)
             if use_std and len(rewards) > 1:
                 std = statistics.pstdev(rewards)
-                for bk in active:
+                for bk in eligible:
                     adv_map[bk] = (ep_reward[bk] - mean) / (std + 1e-6)
             else:
-                for bk in active:
+                for bk in eligible:
                     adv_map[bk] = ep_reward[bk] - mean
 
         for bk, pos_list in ep_positions.items():
@@ -262,7 +289,16 @@ def post_process_rewards(
     adv: dict[int, float] = {}
     n_vg = n_bg = 0
     if vanilla_idx:
-        adv.update(_normalize_positions(flat, vanilla_idx, args, use_std, _vanilla_group_key))
+        adv.update(
+            _normalize_positions(
+                flat,
+                vanilla_idx,
+                args,
+                use_std,
+                _vanilla_group_key,
+                include_zero_token_episodes=True,
+            )
+        )
         n_vg = len({_vanilla_group_key(flat[i]) for i in vanilla_idx})
     if branch_idx:
         adv.update(_normalize_positions(flat, branch_idx, args, use_std, _step_group_key))
@@ -284,7 +320,11 @@ def post_process_rewards(
 
 
 def filter(args: Any, data: list[Any]) -> None:
-    """Filter degenerate groups, then assign the Hybrid loss objective."""
+    """Filter degenerate Stage-2 groups, then assign the Hybrid objective.
+
+    Stage-1 follows plain GRPO and is never removed for zero reward variance.
+    Its degenerate counts are retained as audit metrics only.
+    """
     del args
     flat = _flatten(data)
     if not flat:
@@ -293,7 +333,13 @@ def filter(args: Any, data: list[Any]) -> None:
     vanilla = [s for s in flat if _is_vanilla(s)]
     branch = [s for s in flat if not _is_vanilla(s)]
 
-    def _drop_group(members: list[Sample], key_fn) -> tuple[int, int, int]:
+    def _inspect_groups(
+        members: list[Sample],
+        key_fn,
+        *,
+        include_zero_token_episodes: bool,
+        drop: bool,
+    ) -> tuple[int, int, int]:
         groups: dict[Any, list[Sample]] = defaultdict(list)
         for s in members:
             groups[key_fn(s)].append(s)
@@ -307,7 +353,11 @@ def filter(args: Any, data: list[Any]) -> None:
                 episode_key = _branch_key(s)
                 per_ep[episode_key] += float(s.reward or 0.0)
                 per_ep_tokens[episode_key] += _active_mask_tokens(s)
-            rewards = [reward for key, reward in per_ep.items() if per_ep_tokens[key] > 0]
+            rewards = [
+                reward
+                for key, reward in per_ep.items()
+                if include_zero_token_episodes or per_ep_tokens[key] > 0
+            ]
             std = statistics.pstdev(rewards) if len(rewards) > 1 else 0.0
             reason = ""
             if total_mask == 0:
@@ -316,7 +366,7 @@ def filter(args: Any, data: list[Any]) -> None:
             elif std <= 0.0:
                 reason = "std_zero"
                 n_std += 1
-            if reason:
+            if reason and drop:
                 for s in mem:
                     s.is_filtered_out = True
                     s.remove_sample = True
@@ -326,8 +376,18 @@ def filter(args: Any, data: list[Any]) -> None:
         return len(groups), n_std, n_mask
 
     if _env_bool("STEP_GRPO_FILTER", True):
-        vg, vs, vm = _drop_group(vanilla, _vanilla_group_key)
-        bg, bs, bm = _drop_group(branch, _step_group_key)
+        vg, vs, vm = _inspect_groups(
+            vanilla,
+            _vanilla_group_key,
+            include_zero_token_episodes=True,
+            drop=False,
+        )
+        bg, bs, bm = _inspect_groups(
+            branch,
+            _step_group_key,
+            include_zero_token_episodes=False,
+            drop=True,
+        )
     else:
         vg = len({_vanilla_group_key(s) for s in vanilla})
         bg = len({_step_group_key(s) for s in branch})
@@ -335,7 +395,7 @@ def filter(args: Any, data: list[Any]) -> None:
 
     active_v, active_bg, active_b = _assign_loss_weights(flat)
     logger.info(
-        "[step_grpo_adv] filter: vanilla_groups=%d (std0=%d mask0=%d) "
+        "[step_grpo_adv] filter: vanilla_groups=%d (std0=%d mask0=%d audit_only) "
         "branch_groups=%d (std0=%d mask0=%d) active_vanilla_episodes=%d "
         "active_branch_groups=%d active_branch_episodes=%d branch_lambda=%.6g",
         vg,

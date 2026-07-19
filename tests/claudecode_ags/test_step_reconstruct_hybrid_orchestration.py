@@ -243,7 +243,43 @@ def test_hybrid_branches_k_times_k(tmp_path):
     assert len({s.rollout_id for s in out}) == 1
 
 
-def test_hybrid_all_trials_fail_returns_abort_sample():
+def test_hybrid_partial_trial_failure_keeps_grpo_slot(tmp_path):
+    os.environ["STEP_GRPO_HYBRID_K"] = "2"
+    bundle = _bundle(tmp_path, ["", "diff --git a/a b/a\n+1\n"])
+
+    async def vanilla_runner(**kwargs):
+        i = kwargs["trial_idx"]
+        if i == 0:
+            raise ConnectionError("ags unavailable")
+        return bundle, [_sample(1.0, index=i)], True, [[], [-1.0]]
+
+    out = asyncio.run(
+        hybrid_generate(
+            SimpleNamespace(),
+            _sample(index=7),
+            {},
+            vanilla_runner=vanilla_runner,
+            branch_runner=AsyncMock(),
+        )
+    )
+
+    assert len(out) == 2
+    by_trial = {s.metadata["trial_idx"]: s for s in out}
+    aborted = by_trial[0]
+    assert aborted.status == Sample.Status.ABORTED
+    assert aborted.remove_sample is True
+    assert aborted.reward == 0.0
+    assert aborted.loss_mask == [0]
+    assert aborted.index == 7 * 4096
+    assert aborted.metadata["branch_uid"] == "v:0:t0"
+    assert aborted.metadata["stage1_group_size"] == 2
+    assert by_trial[1].metadata["stage1_group_size"] == 2
+    assert len({s.loss_group_id for s in out}) == 2
+    assert all(s.metadata["hybrid_num_stage1_planned_trials"] == 2 for s in out)
+    assert all(s.metadata["hybrid_num_stage1_aborted_placeholders"] == 1 for s in out)
+
+
+def test_hybrid_all_trials_fail_returns_all_abort_slots():
     os.environ["STEP_GRPO_HYBRID_K"] = "2"
 
     async def vanilla_runner(**kwargs):
@@ -258,14 +294,17 @@ def test_hybrid_all_trials_fail_returns_abort_sample():
             branch_runner=AsyncMock(),
         )
     )
-    assert len(out) == 1
-    s = out[0]
-    assert s.status == Sample.Status.ABORTED
-    assert s.remove_sample is True
-    assert s.tokens == [0, 0]
-    assert s.response_length == 1
-    assert s.loss_mask == [0]
-    assert s.metadata["abort_reason"] == "all_vanilla_trials_failed"
+    assert len(out) == 2
+    assert {s.metadata["trial_idx"] for s in out} == {0, 1}
+    assert len({s.loss_group_id for s in out}) == 2
+    assert all(s.status == Sample.Status.ABORTED for s in out)
+    assert all(s.remove_sample is True for s in out)
+    assert all(s.tokens == [0, 0] for s in out)
+    assert all(s.response_length == 1 for s in out)
+    assert all(s.loss_mask == [0] for s in out)
+    assert all(s.metadata["abort_reason"] == "vanilla_trial_exception:RuntimeError" for s in out)
+    assert all(s.metadata["stage1_group_size"] == 2 for s in out)
+    assert all(s.metadata["hybrid_num_stage1_aborted_placeholders"] == 2 for s in out)
 
 
 def test_hybrid_step_turn_mismatch_raises():

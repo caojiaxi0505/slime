@@ -1,4 +1,4 @@
-# 精确状态分叉控制变量策略梯度
+# 【已废弃】精确状态分叉控制变量策略梯度
 
 英文名：Exact-State Branch Control-Variate Policy Gradient  
 日期：2026-07-19  
