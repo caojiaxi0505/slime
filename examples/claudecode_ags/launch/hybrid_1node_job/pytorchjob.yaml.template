@@ -72,8 +72,11 @@ spec:
                   value: ${LOG_DIR}
                 - name: PHASE
                   value: ${PHASE}
-                - name: WANDB_KEY
-                  value: ${WANDB_KEY}
+                - name: WANDB_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: ${WANDB_SECRET_NAME}
+                      key: ${WANDB_SECRET_KEY}
                 - name: WANDB_PROJECT
                   value: ${WANDB_PROJECT}
                 - name: WANDB_GROUP
@@ -124,6 +127,8 @@ spec:
                   value: "${STEP_GRPO_PPL_CLIP}"
                 - name: STEP_GRPO_FILTER
                   value: "${STEP_GRPO_FILTER}"
+                - name: STEP_GRPO_BRANCH_LOSS_WEIGHT
+                  value: "${STEP_GRPO_BRANCH_LOSS_WEIGHT}"
                 - name: STEP_GRPO_BUNDLE_DIR
                   value: ${STEP_GRPO_BUNDLE_DIR}
                 - name: NNODES

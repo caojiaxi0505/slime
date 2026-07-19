@@ -70,6 +70,14 @@ spec:
                   value: ${EXP_TAG}
                 - name: LOG_DIR
                   value: ${LOG_DIR}
+                - name: LOAD_PATH
+                  value: ${LOAD_PATH}
+                - name: SAVE_PATH
+                  value: ${SAVE_PATH}
+                - name: RUN_ROOT
+                  value: ${RUN_ROOT}
+                - name: RESUME_DEBUG_ROLLOUT_DATA
+                  value: "${RESUME_DEBUG_ROLLOUT_DATA}"
                 - name: PHASE
                   value: ${PHASE}
                 - name: WANDB_KEY
@@ -80,6 +88,10 @@ spec:
                   value: ${WANDB_GROUP}
                 - name: WANDB_TEAM
                   value: ${WANDB_TEAM}
+                - name: WANDB_RUN_ID
+                  value: ${WANDB_RUN_ID}
+                - name: WANDB_RESUME
+                  value: ${WANDB_RESUME}
                 - name: SLIME_ADAPTER_PUBLIC_URL
                   value: ${SLIME_ADAPTER_PUBLIC_URL}
                 - name: ANTHROPIC_BASE_URL
@@ -160,11 +172,15 @@ spec:
                 - name: SLIME_AGENT_COS_CC_PACKAGE
                   value: "cc-prefix-2.1.104-linux-x64.tar.gz"
                 - name: SLIME_CC_TIME_BUDGET_SEC
-                  value: "2700"
+                  value: "${SLIME_CC_TIME_BUDGET_SEC}"
                 - name: SLIME_CC_EVAL_TIMEOUT_SEC
                   value: "600"
                 - name: SLIME_CC_AGENT_CONCURRENCY
-                  value: "64"
+                  value: "${SLIME_CC_AGENT_CONCURRENCY}"
+                - name: SLIME_CC_TOOL_LOOP_PENALTY
+                  value: "${SLIME_CC_TOOL_LOOP_PENALTY}"
+                - name: SLIME_CC_TIMEOUT_OUTCOME_REWARD
+                  value: "${SLIME_CC_TIMEOUT_OUTCOME_REWARD}"
                 - name: SLIME_AGENT_AGS_TIMEOUT
                   value: "75m"
                 - name: SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC
@@ -297,6 +313,14 @@ spec:
                   value: ${EXP_TAG}
                 - name: LOG_DIR
                   value: ${LOG_DIR}
+                - name: LOAD_PATH
+                  value: ${LOAD_PATH}
+                - name: SAVE_PATH
+                  value: ${SAVE_PATH}
+                - name: RUN_ROOT
+                  value: ${RUN_ROOT}
+                - name: RESUME_DEBUG_ROLLOUT_DATA
+                  value: "${RESUME_DEBUG_ROLLOUT_DATA}"
                 - name: PHASE
                   value: ${PHASE}
                 - name: WANDB_KEY
@@ -307,6 +331,10 @@ spec:
                   value: ${WANDB_GROUP}
                 - name: WANDB_TEAM
                   value: ${WANDB_TEAM}
+                - name: WANDB_RUN_ID
+                  value: ${WANDB_RUN_ID}
+                - name: WANDB_RESUME
+                  value: ${WANDB_RESUME}
                 - name: SLIME_ADAPTER_PUBLIC_URL
                   value: ${SLIME_ADAPTER_PUBLIC_URL}
                 - name: ANTHROPIC_BASE_URL
@@ -387,11 +415,15 @@ spec:
                 - name: SLIME_AGENT_COS_CC_PACKAGE
                   value: "cc-prefix-2.1.104-linux-x64.tar.gz"
                 - name: SLIME_CC_TIME_BUDGET_SEC
-                  value: "2700"
+                  value: "${SLIME_CC_TIME_BUDGET_SEC}"
                 - name: SLIME_CC_EVAL_TIMEOUT_SEC
                   value: "600"
                 - name: SLIME_CC_AGENT_CONCURRENCY
-                  value: "64"
+                  value: "${SLIME_CC_AGENT_CONCURRENCY}"
+                - name: SLIME_CC_TOOL_LOOP_PENALTY
+                  value: "${SLIME_CC_TOOL_LOOP_PENALTY}"
+                - name: SLIME_CC_TIMEOUT_OUTCOME_REWARD
+                  value: "${SLIME_CC_TIMEOUT_OUTCOME_REWARD}"
                 - name: SLIME_AGENT_AGS_TIMEOUT
                   value: "75m"
                 - name: SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC

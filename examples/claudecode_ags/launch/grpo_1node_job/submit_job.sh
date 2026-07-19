@@ -21,6 +21,8 @@ Useful env:
   SLIME_ADAPTER_PUBLIC_URL ALB URL (default: jiaxicao GRPO ALB)
   PHASE                    all|train|eval (default all)
   AGS_SECRET_NAME          qwen35-9b-ags-credentials
+  WANDB_SECRET_NAME        Kubernetes Secret name (default wandb-credentials)
+  WANDB_SECRET_KEY         Secret data key (default WANDB_API_KEY)
 EOF
 }
 
@@ -55,13 +57,8 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 WANDB_PROJECT="${WANDB_PROJECT:-coding-rl}"
 WANDB_GROUP="${WANDB_GROUP:-${EXP_TAG}}"
 WANDB_TEAM="${WANDB_TEAM:-models-tencent7723}"
-if [[ -z "${WANDB_KEY:-}" ]]; then
-  _wandb_key_file="${WANDB_KEY_FILE:-${HOME}/.config/jiaxicao/wandb_api_key}"
-  if [[ -f "${_wandb_key_file}" ]]; then
-    WANDB_KEY="$(tr -d '[:space:]' < "${_wandb_key_file}")"
-  fi
-fi
-WANDB_KEY="${WANDB_KEY:-}"
+WANDB_SECRET_NAME="${WANDB_SECRET_NAME:-wandb-credentials}"
+WANDB_SECRET_KEY="${WANDB_SECRET_KEY:-WANDB_API_KEY}"
 
 if [[ "${DELETE}" == "1" ]]; then
   kubectl -n "${K8S_NAMESPACE}" delete pytorchjob "${JOB_NAME}" --ignore-not-found
@@ -81,6 +78,11 @@ if ! kubectl -n "${K8S_NAMESPACE}" get secret "${AGS_SECRET_NAME}" >/dev/null 2>
   exit 1
 fi
 
+if ! kubectl -n "${K8S_NAMESPACE}" get secret "${WANDB_SECRET_NAME}" >/dev/null 2>&1; then
+  echo "ERROR: missing W&B secret ${WANDB_SECRET_NAME} in ${K8S_NAMESPACE}" >&2
+  exit 1
+fi
+
 if ! kubectl -n "${K8S_NAMESPACE}" get ingress jiaxicao-grpo-1node-debug-adapter >/dev/null 2>&1; then
   echo "WARNING: adapter Ingress not found; apply grpo_adapter_alb first." >&2
 fi
@@ -88,10 +90,10 @@ fi
 export JOB_NAME K8S_NAMESPACE IMAGE_URI SLIME_DIR HF_CHECKPOINT REF_MODEL_PATH
 export PROMPT_DATA EVAL_DATA EXP_TAG LOG_DIR PHASE AGS_SECRET_NAME SLIME_ADAPTER_PUBLIC_URL
 export SLIME_AGENT_AGS_TOOL_ID NUM_ROLLOUT SAVE_INTERVAL
-export WANDB_PROJECT WANDB_GROUP WANDB_TEAM WANDB_KEY
+export WANDB_PROJECT WANDB_GROUP WANDB_TEAM WANDB_SECRET_NAME WANDB_SECRET_KEY
 
 RENDERED="$(mktemp)"
-envsubst '${JOB_NAME} ${K8S_NAMESPACE} ${IMAGE_URI} ${SLIME_DIR} ${HF_CHECKPOINT} ${REF_MODEL_PATH} ${PROMPT_DATA} ${EVAL_DATA} ${EXP_TAG} ${LOG_DIR} ${PHASE} ${AGS_SECRET_NAME} ${SLIME_ADAPTER_PUBLIC_URL} ${SLIME_AGENT_AGS_TOOL_ID} ${NUM_ROLLOUT} ${SAVE_INTERVAL} ${WANDB_PROJECT} ${WANDB_GROUP} ${WANDB_TEAM} ${WANDB_KEY}' \
+envsubst '${JOB_NAME} ${K8S_NAMESPACE} ${IMAGE_URI} ${SLIME_DIR} ${HF_CHECKPOINT} ${REF_MODEL_PATH} ${PROMPT_DATA} ${EVAL_DATA} ${EXP_TAG} ${LOG_DIR} ${PHASE} ${AGS_SECRET_NAME} ${SLIME_ADAPTER_PUBLIC_URL} ${SLIME_AGENT_AGS_TOOL_ID} ${NUM_ROLLOUT} ${SAVE_INTERVAL} ${WANDB_PROJECT} ${WANDB_GROUP} ${WANDB_TEAM} ${WANDB_SECRET_NAME} ${WANDB_SECRET_KEY}' \
   < "${TEMPLATE}" > "${RENDERED}"
 
 echo "==> job ${JOB_NAME} in ${K8S_NAMESPACE}"

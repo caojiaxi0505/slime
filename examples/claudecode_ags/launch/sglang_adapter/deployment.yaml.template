@@ -38,6 +38,10 @@ spec:
               value: "${NUM_GPUS}"
             - name: SGLANG_MEM_FRACTION_STATIC
               value: "${SGLANG_MEM_FRACTION_STATIC}"
+            - name: SGLANG_TOOL_CALL_PARSER
+              value: "${SGLANG_TOOL_CALL_PARSER}"
+            - name: SGLANG_REASONING_PARSER
+              value: "${SGLANG_REASONING_PARSER}"
             - name: EXTRA_SGLANG_ARGS
               value: "${EXTRA_SGLANG_ARGS}"
             - name: LAUNCH_DIR

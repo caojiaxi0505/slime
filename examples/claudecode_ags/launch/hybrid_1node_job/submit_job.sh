@@ -27,23 +27,14 @@ Useful env:
   NUM_ROLLOUT              default 88 (one pass @ RBS=16; raise if RBS is smaller)
   STEP_GRPO_HYBRID_K       8
   STEP_GRPO_FILTER         1
+  STEP_GRPO_BRANCH_LOSS_WEIGHT  1.0 (lambda)
   ALLOW_RESUME             1 to allow submitting into a LOG_DIR that already has ckpts
-  WANDB_KEY                optional if ~/.config/jiaxicao/wandb_api_key exists
-  WANDB_KEY_FILE           override path to key file (default above)
+  WANDB_SECRET_NAME        Kubernetes Secret name (default wandb-credentials)
+  WANDB_SECRET_KEY         Secret data key (default WANDB_API_KEY)
   WANDB_PROJECT            coding-rl
   WANDB_TEAM               models-tencent7723 (entity)
   WANDB_GROUP              experiment group (default: EXP_TAG)
 EOF
-}
-
-_load_wandb_key() {
-  if [[ -n "${WANDB_KEY:-}" ]]; then
-    return 0
-  fi
-  local f="${WANDB_KEY_FILE:-${HOME}/.config/jiaxicao/wandb_api_key}"
-  if [[ -f "${f}" ]]; then
-    WANDB_KEY="$(tr -d '[:space:]' < "${f}")"
-  fi
 }
 
 DELETE=0
@@ -77,6 +68,7 @@ STEP_GRPO_BRANCH_SUBMIT_BATCH="${STEP_GRPO_BRANCH_SUBMIT_BATCH:-${STEP_GRPO_BRAN
 STEP_GRPO_BRANCH_CONCURRENCY="${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
 STEP_GRPO_PPL_CLIP="${STEP_GRPO_PPL_CLIP:-20}"
 STEP_GRPO_FILTER="${STEP_GRPO_FILTER:-1}"
+STEP_GRPO_BRANCH_LOSS_WEIGHT="${STEP_GRPO_BRANCH_LOSS_WEIGHT:-1.0}"
 STEP_GRPO_BUNDLE_DIR="${STEP_GRPO_BUNDLE_DIR:-${LOG_DIR}/step_reconstruct_bundles}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-88}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
@@ -85,8 +77,8 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-${ROLLOUT_BATCH_SIZE}}"
 WANDB_PROJECT="${WANDB_PROJECT:-coding-rl}"
 WANDB_TEAM="${WANDB_TEAM:-models-tencent7723}"
-_load_wandb_key
-WANDB_KEY="${WANDB_KEY:-}"
+WANDB_SECRET_NAME="${WANDB_SECRET_NAME:-wandb-credentials}"
+WANDB_SECRET_KEY="${WANDB_SECRET_KEY:-WANDB_API_KEY}"
 # Prefer hybrid EXP_TAG; do not inherit stale GRPO / old-hybrid group from the shell.
 if [[ -z "${WANDB_GROUP:-}" \
    || "${WANDB_GROUP}" == "qwen35_9b_cc_ags_1node_grpo_debug" \
@@ -131,13 +123,13 @@ if ! kubectl -n "${K8S_NAMESPACE}" get secret "${AGS_SECRET_NAME}" >/dev/null 2>
   exit 1
 fi
 
-if ! kubectl -n "${K8S_NAMESPACE}" get ingress "${INGRESS_NAME}" >/dev/null 2>&1; then
-  echo "WARNING: adapter Ingress ${INGRESS_NAME} not found; apply hybrid_adapter_alb first." >&2
+if ! kubectl -n "${K8S_NAMESPACE}" get secret "${WANDB_SECRET_NAME}" >/dev/null 2>&1; then
+  echo "ERROR: missing W&B secret ${WANDB_SECRET_NAME} in ${K8S_NAMESPACE}" >&2
+  exit 1
 fi
 
-if [[ -z "${WANDB_KEY}" ]]; then
-  echo "ERROR: WANDB_KEY missing. Set WANDB_KEY or put the key in ${WANDB_KEY_FILE:-$HOME/.config/jiaxicao/wandb_api_key}" >&2
-  exit 1
+if ! kubectl -n "${K8S_NAMESPACE}" get ingress "${INGRESS_NAME}" >/dev/null 2>&1; then
+  echo "WARNING: adapter Ingress ${INGRESS_NAME} not found; apply hybrid_adapter_alb first." >&2
 fi
 
 # Refuse accidental resume into the old empty-run checkpoint dir (or any dir with ckpts).
@@ -155,12 +147,12 @@ fi
 export JOB_NAME WORKLOAD_LABEL K8S_NAMESPACE IMAGE_URI SLIME_DIR HF_CHECKPOINT REF_MODEL_PATH
 export PROMPT_DATA EVAL_DATA EXP_TAG LOG_DIR PHASE AGS_SECRET_NAME SLIME_ADAPTER_PUBLIC_URL
 export SLIME_AGENT_AGS_TOOL_ID
-export WANDB_KEY WANDB_PROJECT WANDB_GROUP WANDB_TEAM
-export STEP_GRPO_HYBRID_K STEP_GRPO_BRANCH_SUBMIT_BATCH STEP_GRPO_BRANCH_CONCURRENCY STEP_GRPO_PPL_CLIP STEP_GRPO_FILTER
+export WANDB_SECRET_NAME WANDB_SECRET_KEY WANDB_PROJECT WANDB_GROUP WANDB_TEAM
+export STEP_GRPO_HYBRID_K STEP_GRPO_BRANCH_SUBMIT_BATCH STEP_GRPO_BRANCH_CONCURRENCY STEP_GRPO_PPL_CLIP STEP_GRPO_FILTER STEP_GRPO_BRANCH_LOSS_WEIGHT
 export STEP_GRPO_BUNDLE_DIR NUM_ROLLOUT SAVE_INTERVAL GLOBAL_BATCH_SIZE ROLLOUT_BATCH_SIZE
 
 RENDERED="$(mktemp)"
-envsubst '${JOB_NAME} ${WORKLOAD_LABEL} ${K8S_NAMESPACE} ${IMAGE_URI} ${SLIME_DIR} ${HF_CHECKPOINT} ${REF_MODEL_PATH} ${PROMPT_DATA} ${EVAL_DATA} ${EXP_TAG} ${LOG_DIR} ${PHASE} ${AGS_SECRET_NAME} ${SLIME_ADAPTER_PUBLIC_URL} ${SLIME_AGENT_AGS_TOOL_ID} ${WANDB_KEY} ${WANDB_PROJECT} ${WANDB_GROUP} ${WANDB_TEAM} ${STEP_GRPO_HYBRID_K} ${STEP_GRPO_BRANCH_SUBMIT_BATCH} ${STEP_GRPO_BRANCH_CONCURRENCY} ${STEP_GRPO_PPL_CLIP} ${STEP_GRPO_FILTER} ${STEP_GRPO_BUNDLE_DIR} ${NUM_ROLLOUT} ${SAVE_INTERVAL} ${GLOBAL_BATCH_SIZE} ${ROLLOUT_BATCH_SIZE}' \
+envsubst '${JOB_NAME} ${WORKLOAD_LABEL} ${K8S_NAMESPACE} ${IMAGE_URI} ${SLIME_DIR} ${HF_CHECKPOINT} ${REF_MODEL_PATH} ${PROMPT_DATA} ${EVAL_DATA} ${EXP_TAG} ${LOG_DIR} ${PHASE} ${AGS_SECRET_NAME} ${SLIME_ADAPTER_PUBLIC_URL} ${SLIME_AGENT_AGS_TOOL_ID} ${WANDB_SECRET_NAME} ${WANDB_SECRET_KEY} ${WANDB_PROJECT} ${WANDB_GROUP} ${WANDB_TEAM} ${STEP_GRPO_HYBRID_K} ${STEP_GRPO_BRANCH_SUBMIT_BATCH} ${STEP_GRPO_BRANCH_CONCURRENCY} ${STEP_GRPO_PPL_CLIP} ${STEP_GRPO_FILTER} ${STEP_GRPO_BRANCH_LOSS_WEIGHT} ${STEP_GRPO_BUNDLE_DIR} ${NUM_ROLLOUT} ${SAVE_INTERVAL} ${GLOBAL_BATCH_SIZE} ${ROLLOUT_BATCH_SIZE}' \
   < "${TEMPLATE}" > "${RENDERED}"
 
 echo "==> job ${JOB_NAME} in ${K8S_NAMESPACE}"
@@ -171,8 +163,8 @@ echo "    SLIME_AGENT_AGS_TOOL_ID=${SLIME_AGENT_AGS_TOOL_ID}"
 echo "    PHASE=${PHASE} LOG_DIR=${LOG_DIR}"
 echo "    PROMPT_DATA=${PROMPT_DATA}"
 echo "    NUM_ROLLOUT=${NUM_ROLLOUT} SAVE_INTERVAL=${SAVE_INTERVAL} RBS=${ROLLOUT_BATCH_SIZE} GBS=${GLOBAL_BATCH_SIZE}"
-echo "    hybrid K=${STEP_GRPO_HYBRID_K} filter=${STEP_GRPO_FILTER} submit_batch=${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
-echo "    WANDB project=${WANDB_PROJECT} team=${WANDB_TEAM} group=${WANDB_GROUP} key=***"
+echo "    hybrid K=${STEP_GRPO_HYBRID_K} filter=${STEP_GRPO_FILTER} lambda=${STEP_GRPO_BRANCH_LOSS_WEIGHT} submit_batch=${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
+echo "    WANDB project=${WANDB_PROJECT} team=${WANDB_TEAM} group=${WANDB_GROUP} credential=secret/${WANDB_SECRET_NAME}"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   kubectl apply --dry-run=client -f "${RENDERED}"

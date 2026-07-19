@@ -117,6 +117,7 @@ export STEP_GRPO_BRANCH_SUBMIT_BATCH="${STEP_GRPO_BRANCH_SUBMIT_BATCH:-${STEP_GR
 export STEP_GRPO_BRANCH_CONCURRENCY="${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
 export STEP_GRPO_PPL_CLIP="${STEP_GRPO_PPL_CLIP:-20}"
 export STEP_GRPO_FILTER="${STEP_GRPO_FILTER:-1}"
+export STEP_GRPO_BRANCH_LOSS_WEIGHT="${STEP_GRPO_BRANCH_LOSS_WEIGHT:-1.0}"
 
 if [[ "${PHASE}" == "eval" ]]; then
   # train.py: if num_rollout == 0 and eval_interval is set → eval-only.
@@ -293,12 +294,11 @@ ROLLOUT_ARGS=(
   --custom-rollout-log-function-path examples.claudecode_ags.wandb_metrics.log_rollout_data
 )
 
-# Default-on filter (STEP_GRPO_FILTER=1); set 0 to skip wiring the path.
-if [[ "${STEP_GRPO_FILTER}" != "0" ]]; then
-  ROLLOUT_ARGS+=(
-    --rollout-sample-filter-path examples.claudecode_ags.step_reconstruct.step_grpo_advantage.filter
-  )
-fi
+# This hook always runs because it assigns the explicit loss objective after
+# filtering. STEP_GRPO_FILTER=0 disables only the degenerate-group removal.
+ROLLOUT_ARGS+=(
+  --rollout-sample-filter-path examples.claudecode_ags.step_reconstruct.step_grpo_advantage.filter
+)
 
 RESUME_DEBUG_ROLLOUT_DATA="${RESUME_DEBUG_ROLLOUT_DATA:-1}"
 if [[ "${RESUME_DEBUG_ROLLOUT_DATA}" = "0" ]]; then
@@ -495,6 +495,57 @@ mkdir -p \
   "${LOG_DIR}/wandb" \
   "${LOG_DIR}/rollout_dumps" \
   "${LOG_DIR}/launcher_logs"
+
+# Safe, reproducible run manifest. Credentials are intentionally absent.
+python3 - "${LOG_DIR}/run_manifest.json" "${EXP_TAG}" "${STEP_GRPO_HYBRID_K}" \
+  "${STEP_GRPO_FILTER}" "${STEP_GRPO_BRANCH_LOSS_WEIGHT}" "${ROLLOUT_BATCH_SIZE}" \
+  "${GLOBAL_BATCH_SIZE}" "${STEP_GRPO_BUNDLE_DIR}" "${SLIME_CC_TIME_BUDGET_SEC}" \
+  "${STEP_GRPO_BRANCH_BUDGET_SEC}" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+(
+    path,
+    exp_tag,
+    hybrid_k,
+    filter_enabled,
+    branch_weight,
+    rollout_batch_size,
+    global_batch_size,
+    bundle_dir,
+    stage1_budget,
+    branch_budget,
+) = sys.argv[1:]
+try:
+    git_commit = subprocess.check_output(
+        ["git", "-C", os.environ["SLIME_DIR"], "rev-parse", "HEAD"], text=True
+    ).strip()
+except Exception:
+    git_commit = "unknown"
+manifest = {
+    "schema_version": 1,
+    "experiment": exp_tag,
+    "git_commit": git_commit,
+    "objective": "mean_prompt(L_v + lambda * L_b)",
+    "stage1_episode_weighting": "equal_after_filter",
+    "stage2_group_weighting": "equal_edit_groups_then_equal_branches_after_filter",
+    "step_grpo_hybrid_k": int(hybrid_k),
+    "step_grpo_filter": filter_enabled not in {"0", "false", "False"},
+    "step_grpo_branch_loss_weight": float(branch_weight),
+    "rollout_batch_size": int(rollout_batch_size),
+    "global_batch_size": int(global_batch_size),
+    "bundle_dir": bundle_dir,
+    "stage1_agent_budget_sec": int(stage1_budget),
+    "stage2_agent_budget_sec": int(branch_budget),
+}
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, path)
+PY
 
 # ============ bring up ray (multi-node via Kubeflow RANK) ============
 # RANK=0 (Master): start Ray head + train. RANK>0 (Worker): join and idle.

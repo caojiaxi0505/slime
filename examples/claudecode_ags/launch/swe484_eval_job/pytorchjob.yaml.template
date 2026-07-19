@@ -73,8 +73,6 @@ spec:
                   value: ${LOG_DIR}
                 - name: PHASE
                   value: eval
-                - name: WANDB_KEY
-                  value: ${WANDB_KEY}
                 - name: WANDB_PROJECT
                   value: ${WANDB_PROJECT}
                 - name: WANDB_GROUP

@@ -7,6 +7,8 @@ from slime.utils.http_utils import get, post
 logger = logging.getLogger(__name__)
 
 ABORT_RETRY_INTERVAL_SECONDS = 3
+IDLE_CONFIRMATIONS = 3
+IDLE_CONFIRM_INTERVAL_SECONDS = 1
 
 
 def num_requests_from_load(load: Any) -> int:
@@ -40,8 +42,23 @@ async def _get_server_num_requests(url: str) -> int:
     return num_requests_from_load(await get(f"{url}/v1/loads?include=core"))
 
 
-async def abort_server_until_idle(url: str, retry_interval: int = ABORT_RETRY_INTERVAL_SECONDS) -> None:
+async def abort_server_until_idle(
+    url: str,
+    retry_interval: int = ABORT_RETRY_INTERVAL_SECONDS,
+    *,
+    idle_confirmations: int = IDLE_CONFIRMATIONS,
+    idle_confirm_interval: int = IDLE_CONFIRM_INTERVAL_SECONDS,
+) -> None:
+    """Abort requests until the server stays idle across several polls.
+
+    A single zero-load observation is insufficient: an already-running adapter
+    handler can submit its next SGLang turn immediately after that observation.
+    Re-aborting and requiring a short stable-idle window drains those late
+    arrivals before cache flush/offload.  This does not quiesce the adapter;
+    callers must still ensure agent producers have been terminated.
+    """
     attempt = 1
+    consecutive_idle = 0
     while True:
         logger.info(f"Abort request for SGLang server {url}")
         await _abort_server_once(url)
@@ -53,7 +70,14 @@ async def abort_server_until_idle(url: str, retry_interval: int = ABORT_RETRY_IN
             return
 
         if num_requests <= 0:
-            return
+            consecutive_idle += 1
+            if consecutive_idle >= idle_confirmations:
+                return
+            await asyncio.sleep(idle_confirm_interval)
+            attempt += 1
+            continue
+
+        consecutive_idle = 0
 
         logger.info(
             f"SGLang server {url} still has {num_requests} requests after abort attempt {attempt}; "
