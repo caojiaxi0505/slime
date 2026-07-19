@@ -90,6 +90,8 @@ spec:
                   value: ${WANDB_GROUP}
                 - name: WANDB_TEAM
                   value: ${WANDB_TEAM}
+                - name: WANDB_FORK_FROM
+                  value: ${WANDB_FORK_FROM}
                 - name: WANDB_RESUME_FROM
                   value: ${WANDB_RESUME_FROM}
                 - name: WANDB_RUN_ID
@@ -355,6 +357,8 @@ spec:
                   value: ${WANDB_GROUP}
                 - name: WANDB_TEAM
                   value: ${WANDB_TEAM}
+                - name: WANDB_FORK_FROM
+                  value: ${WANDB_FORK_FROM}
                 - name: WANDB_RESUME_FROM
                   value: ${WANDB_RESUME_FROM}
                 - name: WANDB_RUN_ID

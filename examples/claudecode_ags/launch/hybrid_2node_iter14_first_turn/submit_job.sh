@@ -40,8 +40,7 @@ export SLIME_AGENT_AGS_TOOL_ID="sdt-db5nvd67"
 # ``hy9ro2`` is the connected Hybrid v9 history. Its W&B internal step 59 is
 # the final log row for rollout/step=14; the fork therefore starts logging at 15.
 export WANDB_GROUP="${WANDB_GROUP:-${EXP_TAG}}"
-export WANDB_RESUME_FROM="${WANDB_RESUME_FROM:-hy9ro2?_step=59}"
-export WANDB_RESUME="auto"
-unset WANDB_RUN_ID
+export WANDB_FORK_FROM="${WANDB_FORK_FROM:-hy9ro2?_step=59}"
+unset WANDB_RESUME_FROM WANDB_RESUME WANDB_RUN_ID
 
 exec bash "${LAUNCH_DIR}/hybrid_2node_job/submit_job.sh" "$@"

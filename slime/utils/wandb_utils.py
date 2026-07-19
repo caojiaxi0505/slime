@@ -7,6 +7,27 @@ import wandb
 logger = logging.getLogger(__name__)
 
 
+def _wandb_lineage_kwargs_from_env() -> dict[str, str]:
+    """Translate the mutually exclusive W&B lineage environment settings."""
+    fork_from = os.environ.get("WANDB_FORK_FROM", "").strip()
+    resume_from = os.environ.get("WANDB_RESUME_FROM", "").strip()
+    if fork_from and resume_from:
+        raise ValueError("WANDB_FORK_FROM and WANDB_RESUME_FROM are mutually exclusive")
+    if fork_from:
+        return {"fork_from": fork_from}
+    if resume_from:
+        return {"resume_from": resume_from}
+
+    kwargs = {}
+    run_id = os.environ.get("WANDB_RUN_ID", "").strip()
+    resume = os.environ.get("WANDB_RESUME", "").strip()
+    if run_id:
+        kwargs["id"] = run_id
+    if resume:
+        kwargs["resume"] = resume
+    return kwargs
+
+
 def _is_offline_mode(args) -> bool:
     """Detect whether W&B should run in offline mode.
 
@@ -57,16 +78,7 @@ def init_wandb_primary(args):
         "name": run_name,
         "config": _compute_config_for_logging(args),
     }
-    resume_from = os.environ.get("WANDB_RESUME_FROM", "").strip()
-    if resume_from:
-        init_kwargs["resume_from"] = resume_from
-    else:
-        run_id = os.environ.get("WANDB_RUN_ID", "").strip()
-        resume = os.environ.get("WANDB_RESUME", "").strip()
-        if run_id:
-            init_kwargs["id"] = run_id
-        if resume:
-            init_kwargs["resume"] = resume
+    init_kwargs.update(_wandb_lineage_kwargs_from_env())
 
     # Configure settings based on offline/online mode
     if offline:

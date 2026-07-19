@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from slime.utils import wandb_utils
-from slime.utils.wandb_utils import _compute_config_for_logging
+from slime.utils.wandb_utils import _compute_config_for_logging, _wandb_lineage_kwargs_from_env
 
 
 def test_wandb_config_redacts_key_and_records_hybrid_objective(monkeypatch):
@@ -29,3 +29,21 @@ def test_coding_agent_metrics_use_rollout_step(monkeypatch):
 
     for namespace in ("outcome", "traj", "behavior", "resume", "task"):
         assert definitions[f"{namespace}/*"] == {"step_metric": "rollout/step"}
+
+
+def test_wandb_fork_from_is_forwarded_without_resume(monkeypatch):
+    monkeypatch.setenv("WANDB_FORK_FROM", "parent?_step=59")
+    monkeypatch.setenv("WANDB_RESUME", "auto")
+    monkeypatch.setenv("WANDB_RUN_ID", "stale-id")
+    assert _wandb_lineage_kwargs_from_env() == {"fork_from": "parent?_step=59"}
+
+
+def test_wandb_fork_and_rewind_are_mutually_exclusive(monkeypatch):
+    monkeypatch.setenv("WANDB_FORK_FROM", "parent?_step=59")
+    monkeypatch.setenv("WANDB_RESUME_FROM", "parent?_step=59")
+    try:
+        _wandb_lineage_kwargs_from_env()
+    except ValueError as exc:
+        assert "mutually exclusive" in str(exc)
+    else:
+        raise AssertionError("expected conflicting W&B lineage settings to fail")

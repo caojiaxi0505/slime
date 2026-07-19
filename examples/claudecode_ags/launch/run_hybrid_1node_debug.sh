@@ -41,11 +41,13 @@ export SLIME_DIR
 # shellcheck disable=SC1091
 source "${EXAMPLE_DIR}/env/load_env.sh"
 
-# W&B treats resume_from (fork a new run), resume (continue the same run),
-# and run_id as mutually exclusive settings. Kubernetes templates necessarily
-# inject every declared env key, so remove the inactive pair before importing
-# wandb instead of leaving an empty or "auto" value behind.
-if [[ -n "${WANDB_RESUME_FROM:-}" ]]; then
+# W&B treats fork/rewind points, ordinary resume, and run_id as mutually
+# exclusive settings. Kubernetes templates inject every declared env key, so
+# remove inactive values before importing wandb.
+if [[ -n "${WANDB_FORK_FROM:-}" && -n "${WANDB_RESUME_FROM:-}" ]]; then
+  echo "ERROR: WANDB_FORK_FROM and WANDB_RESUME_FROM are mutually exclusive" >&2
+  exit 2
+elif [[ -n "${WANDB_FORK_FROM:-}" || -n "${WANDB_RESUME_FROM:-}" ]]; then
   unset WANDB_RUN_ID WANDB_RESUME
 else
   [[ -n "${WANDB_RUN_ID:-}" ]] || unset WANDB_RUN_ID
