@@ -41,6 +41,17 @@ export SLIME_DIR
 # shellcheck disable=SC1091
 source "${EXAMPLE_DIR}/env/load_env.sh"
 
+# W&B treats resume_from (fork a new run), resume (continue the same run),
+# and run_id as mutually exclusive settings. Kubernetes templates necessarily
+# inject every declared env key, so remove the inactive pair before importing
+# wandb instead of leaving an empty or "auto" value behind.
+if [[ -n "${WANDB_RESUME_FROM:-}" ]]; then
+  unset WANDB_RUN_ID WANDB_RESUME
+else
+  [[ -n "${WANDB_RUN_ID:-}" ]] || unset WANDB_RUN_ID
+  [[ -n "${WANDB_RESUME:-}" ]] || unset WANDB_RESUME
+fi
+
 RUN="${RUN:-0}"
 PHASE="${PHASE:-all}"
 case "${PHASE}" in
