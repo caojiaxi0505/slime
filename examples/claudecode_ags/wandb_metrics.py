@@ -18,6 +18,7 @@ Metric口径 (hybrid / step-GRPO)::
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter, defaultdict
 from typing import Any
 
@@ -39,12 +40,40 @@ def _sample_kind(sample) -> str:
 
 def _episode_key(sample) -> tuple[Any, ...]:
     md = _meta(sample)
+    kind = _sample_kind(sample)
+    # Hybrid compact segments carry the true episode identity explicitly.
+    # Prefer it over Sample.index: the old branch index omitted edit_step_i,
+    # so branches with the same source trial / branch number at different
+    # edit points collided in W&B.
+    explicit_uid = md.get("branch_uid")
+    if explicit_uid is None:
+        explicit_uid = getattr(sample, "loss_group_id", None)
+    if explicit_uid is not None:
+        return (
+            md.get("instance_id"),
+            getattr(sample, "group_index", None),
+            kind,
+            "episode_uid",
+            explicit_uid,
+        )
+    if kind == "branch":
+        return (
+            md.get("instance_id"),
+            getattr(sample, "group_index", None),
+            kind,
+            md.get("step_group_key"),
+            md.get("edit_step_i", md.get("step_t")),
+            md.get("source_trial_idx"),
+            md.get("branch_idx"),
+            getattr(sample, "index", None),
+            getattr(sample, "rollout_id", None),
+        )
     return (
         md.get("instance_id"),
         getattr(sample, "group_index", None),
         getattr(sample, "index", None),
         getattr(sample, "rollout_id", None),
-        _sample_kind(sample),
+        kind,
     )
 
 
@@ -244,6 +273,53 @@ def _reward_source_metrics(samples: list) -> dict[str, float]:
     return out
 
 
+def _tool_loop_metrics_for_episodes(eps: list, *, prefix: str) -> dict[str, float]:
+    """Repeated tool-signature prevalence for one rollout step and stage."""
+    from slime.utils.metric_utils import compute_statistics
+
+    checked = [
+        s
+        for s in eps
+        if bool(_meta(s).get("tool_loop_detection_enabled"))
+        or bool(
+            (_meta(s).get("reward_details") or {}).get("tool_loop_detection_enabled")
+            if isinstance(_meta(s).get("reward_details"), dict)
+            else False
+        )
+    ]
+    if not checked:
+        return {}
+    runs = [float(_md_int(s, "consecutive_tool_signature_max")) for s in checked]
+    out = {
+        f"{prefix}/n_checked_episodes": float(len(runs)),
+    }
+    out.update(
+        {
+            f"{prefix}/consecutive_signature_max/{stat}": value
+            for stat, value in compute_statistics(runs).items()
+        }
+    )
+    for threshold in (3, 4, 5):
+        count = sum(value >= threshold for value in runs)
+        out[f"{prefix}/ge_{threshold}_count"] = float(count)
+        out[f"{prefix}/ge_{threshold}_rate"] = float(count) / float(len(runs))
+    return out
+
+
+def _tool_loop_metrics(samples: list) -> dict[str, float]:
+    """Stage-1 curves at the common path; Hybrid Stage-2 under stage-2."""
+    stage1, stage2 = _split_stage_episodes(samples)
+    out = _tool_loop_metrics_for_episodes(stage1, prefix="behavior/tool_loop")
+    if stage2 or _has_hybrid(samples):
+        out.update(
+            _tool_loop_metrics_for_episodes(
+                stage2,
+                prefix="behavior/stage-2/tool_loop",
+            )
+        )
+    return out
+
+
 def _filter_kind(samples: list, kind: str) -> list:
     if kind == "branch":
         return [s for s in samples if _sample_kind(s) == "branch"]
@@ -261,6 +337,7 @@ def _timing_metrics_for_episodes(eps: list, *, prefix: str) -> dict[str, float]:
 
     out: dict[str, float] = {}
     for key, leaf in (
+        ("agent_queue_wait_sec", "agent_queue_wait"),
         ("agent_elapsed_sec", "agent_time"),
         ("eval_elapsed_sec", "eval_time"),
         ("total_elapsed_sec", "sample_wall_time"),
@@ -269,6 +346,240 @@ def _timing_metrics_for_episodes(eps: list, *, prefix: str) -> dict[str, float]:
         if vals:
             out.update({f"{prefix}/{leaf}/{k}": v for k, v in compute_statistics(vals).items()})
             out[f"{prefix}/{leaf}/sum"] = float(sum(vals))
+
+    # The adapter stores one aggregate per Claude attempt.  These are already
+    # deduplicated here at episode granularity, so compact segment fan-out does
+    # not multiply the measurements.
+    for key, leaf in (
+        ("adapter_loop_delay_ms_mean", "loop_delay_ms"),
+        ("adapter_session_lock_wait_ms_mean", "session_lock_wait_ms"),
+        ("adapter_json_ms_mean", "json_ms"),
+        ("adapter_hash_ms_mean", "hash_ms"),
+        ("adapter_prepare_tokenize_ms_mean", "prepare_tokenize_ms"),
+        ("adapter_parse_ms_mean", "parse_ms"),
+        ("adapter_cpu_queue_ms_mean", "cpu_queue_ms"),
+        ("adapter_cpu_ms_mean", "cpu_ms"),
+        ("adapter_sglang_e2e_ms_mean", "sglang_e2e_ms"),
+        ("adapter_total_ms_mean", "turn_total_ms"),
+    ):
+        vals = _series(eps, key)
+        if vals:
+            out.update(
+                {
+                    f"{prefix}/adapter/{leaf}/{stat}": value
+                    for stat, value in compute_statistics(vals).items()
+                }
+            )
+
+    turn_counts = _series(eps, "adapter_turn_count")
+    failed_counts = _series(eps, "adapter_failed_request_count")
+    if turn_counts:
+        total_turns = float(sum(turn_counts))
+        out[f"{prefix}/adapter/n_turns"] = total_turns
+        out[f"{prefix}/adapter/n_episodes_with_timing"] = float(len(turn_counts))
+        if failed_counts and total_turns > 0:
+            out[f"{prefix}/adapter/request_failure_rate"] = float(sum(failed_counts)) / total_turns
+    return out
+
+
+def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
+    """Audit counts for the explicit ``L_v + lambda * L_b`` objective."""
+    out: dict[str, float] = {}
+    groups = _group_by_episode(samples)
+    active_eps = {"vanilla": 0, "branch": 0}
+    active_tokens = {"vanilla": 0, "branch": 0}
+    nominal_weights = {"vanilla": 0.0, "branch": 0.0}
+    active_edit_groups: set[tuple[Any, ...]] = set()
+    transcript_known = 0
+    transcript_invalid = 0
+    resume_known = 0
+    resume_verified = 0
+    resume_echo_mismatches = 0
+    resume_echo_mismatch_branches = 0
+    resume_echo_missing = 0
+    resume_echo_payload_mismatches = 0
+    resume_schema_mismatches = 0
+    resume_schema_mismatch_branches = 0
+    resume_unavailable_tools = 0
+    resume_unavailable_tool_branches = 0
+    resume_invalid_tool_inputs = 0
+    resume_invalid_tool_input_branches = 0
+    resume_max_tokens_continuations = 0
+    resume_post_end_turn_acks = 0
+    resume_request_replays = 0
+    resume_request_replay_branches = 0
+    resume_hashes: dict[tuple[Any, ...], set[str]] = defaultdict(set)
+
+    for members in groups.values():
+        stage = _sample_kind(members[0])
+        if stage == "vanilla":
+            validity = next(
+                (_meta(s).get("transcript_valid") for s in members if "transcript_valid" in _meta(s)),
+                None,
+            )
+            if validity is not None:
+                transcript_known += 1
+                transcript_invalid += int(not bool(validity))
+        else:
+            md = _meta(members[0])
+            if "prompt_exact" in md or "prefix_reseed_verified" in md:
+                resume_known += 1
+                resume_verified += int(
+                    bool(md.get("prompt_exact", md.get("prefix_reseed_verified")))
+                )
+                echo_mismatches = int(md.get("tool_use_echo_mismatch_count") or 0)
+                resume_echo_mismatches += echo_mismatches
+                resume_echo_mismatch_branches += int(echo_mismatches > 0)
+                resume_echo_missing += int(md.get("tool_use_echo_missing_count") or 0)
+                resume_echo_payload_mismatches += int(
+                    md.get("tool_use_echo_payload_mismatch_count") or 0
+                )
+                schema_mismatches = int(md.get("runtime_tool_schema_mismatch_count") or 0)
+                resume_schema_mismatches += schema_mismatches
+                resume_schema_mismatch_branches += int(schema_mismatches > 0)
+                unavailable_tools = int(
+                    md.get("generated_runtime_tool_unavailable_count") or 0
+                )
+                resume_unavailable_tools += unavailable_tools
+                resume_unavailable_tool_branches += int(unavailable_tools > 0)
+                invalid_tool_inputs = int(
+                    md.get("generated_runtime_tool_input_invalid_count") or 0
+                )
+                resume_invalid_tool_inputs += invalid_tool_inputs
+                resume_invalid_tool_input_branches += int(invalid_tool_inputs > 0)
+                resume_max_tokens_continuations += int(
+                    md.get("max_tokens_continuation_count") or 0
+                )
+                resume_post_end_turn_acks += int(md.get("post_end_turn_ack_count") or 0)
+                request_replays = int(md.get("resume_request_replay_count") or 0)
+                resume_request_replays += request_replays
+                resume_request_replay_branches += int(request_replays > 0)
+            prompt_hash = str(md.get("prompt_sha256") or "")
+            if prompt_hash:
+                resume_hashes[
+                    (
+                        md.get("instance_id"),
+                        getattr(members[0], "group_index", None),
+                        md.get("step_group_key"),
+                    )
+                ].add(prompt_hash)
+
+        tokens = 0
+        for s in members:
+            if getattr(s, "remove_sample", False) or getattr(s, "is_filtered_out", False):
+                continue
+            mask = getattr(s, "loss_mask", None)
+            tokens += int(getattr(s, "response_length", 0) or 0) if mask is None else sum(int(x) for x in mask)
+        if tokens <= 0:
+            continue
+
+        active_eps[stage] += 1
+        active_tokens[stage] += tokens
+        weight = next(
+            (
+                _safe_float(getattr(s, "loss_weight", None))
+                for s in members
+                if _safe_float(getattr(s, "loss_weight", None)) is not None
+            ),
+            1.0,
+        )
+        nominal_weights[stage] += float(weight)
+        if stage == "branch":
+            md = _meta(members[0])
+            active_edit_groups.add(
+                (
+                    md.get("instance_id"),
+                    getattr(members[0], "group_index", None),
+                    md.get("step_group_key"),
+                )
+            )
+
+    out["perf/step_grpo/n_stage1_active_episodes"] = float(active_eps["vanilla"])
+    out["perf/step_grpo/n_stage2_active_episodes"] = float(active_eps["branch"])
+    out["perf/step_grpo/n_active_edit_groups"] = float(len(active_edit_groups))
+    out["perf/step_grpo/stage1_active_tokens"] = float(active_tokens["vanilla"])
+    out["perf/step_grpo/stage2_active_tokens"] = float(active_tokens["branch"])
+    out["perf/step_grpo/stage1_nominal_loss_weight"] = nominal_weights["vanilla"]
+    out["perf/step_grpo/stage2_nominal_loss_weight"] = nominal_weights["branch"]
+    out["perf/step_grpo/branch_loss_weight"] = float(os.environ.get("STEP_GRPO_BRANCH_LOSS_WEIGHT", "1"))
+    out["perf/step_grpo/transcript_status_known"] = float(transcript_known)
+    out["perf/step_grpo/transcript_invalid_trials"] = float(transcript_invalid)
+    if resume_known:
+        out["resume/prompt_exact_rate"] = float(resume_verified) / float(resume_known)
+        out["resume/n_verified_branches"] = float(resume_verified)
+        out["resume/n_checked_branches"] = float(resume_known)
+        out["resume/tool_use_echo_mismatch_count"] = float(resume_echo_mismatches)
+        out["resume/tool_use_echo_mismatch_branch_rate"] = float(
+            resume_echo_mismatch_branches
+        ) / float(resume_known)
+        out["resume/tool_use_echo_missing_count"] = float(resume_echo_missing)
+        out["resume/tool_use_echo_payload_mismatch_count"] = float(
+            resume_echo_payload_mismatches
+        )
+        out["resume/runtime_tool_schema_mismatch_count"] = float(resume_schema_mismatches)
+        out["resume/runtime_tool_schema_mismatch_branch_rate"] = float(
+            resume_schema_mismatch_branches
+        ) / float(resume_known)
+        out["resume/generated_runtime_tool_unavailable_count"] = float(
+            resume_unavailable_tools
+        )
+        out["resume/generated_runtime_tool_unavailable_branch_rate"] = float(
+            resume_unavailable_tool_branches
+        ) / float(resume_known)
+        out["resume/generated_runtime_tool_input_invalid_count"] = float(
+            resume_invalid_tool_inputs
+        )
+        out["resume/generated_runtime_tool_input_invalid_branch_rate"] = float(
+            resume_invalid_tool_input_branches
+        ) / float(resume_known)
+        out["resume/max_tokens_continuation_count"] = float(
+            resume_max_tokens_continuations
+        )
+        out["resume/post_end_turn_ack_count"] = float(resume_post_end_turn_acks)
+        out["resume/request_replay_count"] = float(resume_request_replays)
+        out["resume/request_replay_branch_rate"] = float(
+            resume_request_replay_branches
+        ) / float(resume_known)
+    if resume_hashes:
+        consistent = sum(len(hashes) == 1 for hashes in resume_hashes.values())
+        out["resume/checkpoint_hash_consistency_rate"] = float(consistent) / float(
+            len(resume_hashes)
+        )
+        out["resume/n_checked_edit_groups"] = float(len(resume_hashes))
+
+    # These values are stamped once per prompt but repeated on every compact
+    # segment. Deduplicate before summing them across the rollout.
+    prompt_reps: dict[tuple[Any, Any], Any] = {}
+    for s in samples:
+        md = _meta(s)
+        key = (md.get("instance_id"), getattr(s, "group_index", None))
+        prompt_reps.setdefault(key, s)
+    for metadata_key, metric_leaf in (
+        ("hybrid_num_patch_candidates", "n_patch_candidates"),
+        ("hybrid_num_selected_edits", "n_selected_edits"),
+        ("hybrid_num_branch_tasks", "n_branch_tasks"),
+        ("hybrid_num_dropped_branches", "n_dropped_branches"),
+        ("hybrid_num_dropped_timeout", "n_dropped_timeout"),
+        ("hybrid_num_dropped_resume_tool_echo", "n_dropped_resume_tool_echo"),
+        ("hybrid_num_dropped_resume_missing_result", "n_dropped_resume_missing_result"),
+        ("hybrid_num_dropped_resume_no_pending", "n_dropped_resume_no_pending"),
+        ("hybrid_num_dropped_resume_tool_schema", "n_dropped_resume_tool_schema"),
+        ("hybrid_num_dropped_resume_subagent", "n_dropped_resume_subagent"),
+        ("hybrid_num_dropped_resume_other", "n_dropped_resume_other"),
+        ("hybrid_num_dropped_workspace_rebuild", "n_dropped_workspace_rebuild"),
+        ("hybrid_num_dropped_other", "n_dropped_other"),
+    ):
+        values = [_safe_float(_meta(s).get(metadata_key)) for s in prompt_reps.values()]
+        known_values = [v for v in values if v is not None]
+        if known_values:
+            out[f"perf/step_grpo/{metric_leaf}"] = float(sum(known_values))
+    planned = out.get("perf/step_grpo/n_branch_tasks")
+    dropped = out.get("perf/step_grpo/n_dropped_branches")
+    if planned is not None and planned > 0 and dropped is not None:
+        completed = max(planned - dropped, 0.0)
+        out["perf/step_grpo/n_completed_branches"] = completed
+        out["perf/step_grpo/branch_completion_rate"] = completed / planned
+        out["perf/step_grpo/branch_drop_rate"] = dropped / planned
     return out
 
 
@@ -330,6 +641,7 @@ def _timing_metrics(samples: list, rollout_time: float) -> dict[str, float]:
         out["perf/step_grpo/n_samples"] = float(len(samples))
         out["perf/step_grpo/n_stage1_samples"] = float(len(_filter_kind(samples, "vanilla")))
         out["perf/step_grpo/n_stage2_samples"] = float(len(_filter_kind(samples, "branch")))
+        out.update(_hybrid_objective_metrics(samples))
     return out
 
 
@@ -495,6 +807,7 @@ def _trajectory_metrics(samples: list) -> dict[str, float]:
     stage2 = _filter_kind(samples, "branch")
     out = _length_reward_metrics(stage1 or samples, prefix_rollout="rollout", prefix_traj="traj")
     out.update(_outcome_infra_metrics(samples))
+    out.update(_tool_loop_metrics(samples))
     if stage2 or _has_hybrid(samples):
         out.update(
             _length_reward_metrics(stage2, prefix_rollout="rollout/stage-2", prefix_traj="traj/stage-2")

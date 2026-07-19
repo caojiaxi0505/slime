@@ -24,6 +24,7 @@ from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
+from slime.utils.loss_groups import build_loss_group_fields
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.types import Sample
@@ -96,10 +97,16 @@ def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
             for mm_dict in rollout_data["multimodal_train_inputs"]
         ]
 
-    if "rollout_mask_sums" in rollout_data:
-        rollout_data["rollout_mask_sums"] = _cpu_tensor(
-            rollout_data["rollout_mask_sums"],
-            dtype=torch.float32,
+    for key in ["rollout_mask_sums", "loss_group_mask_sums", "loss_weights"]:
+        if key in rollout_data:
+            rollout_data[key] = _cpu_tensor(
+                rollout_data[key],
+                dtype=torch.float32,
+            )
+    if "loss_stage_ids" in rollout_data:
+        rollout_data["loss_stage_ids"] = _cpu_tensor(
+            rollout_data["loss_stage_ids"],
+            dtype=torch.int64,
         )
 
 
@@ -755,6 +762,15 @@ class RolloutManager:
             rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
         train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
 
+        # Loss identity is deliberately separate from scheduling identity.
+        # Without explicit Hybrid annotations, fall back to rollout_id so all
+        # existing rollout paths retain their previous aggregation exactly.
+        # Compact
+        # segments therefore sum into one episode denominator, but independent
+        # Stage-1 trials / Stage-2 branches no longer collapse into the outer
+        # prompt's shared rollout denominator.
+        train_data.update(build_loss_group_fields(samples, rollout_ids, loss_masks))
+
         # Overwrite raw_reward when available. Mixed-source batches may only
         # populate this field for a subset of samples (e.g. SWE but not code).
         if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
@@ -847,6 +863,10 @@ class RolloutManager:
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",
+                "loss_group_ids",
+                "loss_group_mask_sums",
+                "loss_weights",
+                "loss_stage_ids",
                 "rollout_log_probs",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",

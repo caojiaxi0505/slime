@@ -265,10 +265,13 @@ def log_rollout_data(
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
-        # Same per-rollout denominators the training loss uses, so reported
-        # log_probs / returns / advantages / etc. live in the same per-rollout
-        # mean space (rather than per-sample) as the gradient signal.
-        rollout_mask_sums = rollout_data.get("rollout_mask_sums", None)
+        # Use the same episode denominators and explicit objective weights as
+        # training, so diagnostics match the actual gradient signal. Legacy
+        # rollout data falls back to its original per-rollout denominators.
+        sample_denoms = rollout_data.get("loss_group_mask_sums", None)
+        if sample_denoms is None:
+            sample_denoms = rollout_data.get("rollout_mask_sums", None)
+        loss_weights = rollout_data.get("loss_weights", None)
         # For per-rollout-mean metrics: ``rollout_log_metric_contribution``
         # produces the ``(sum, count)`` tuple so gather_log_data's
         # ``Σsum / Σcount`` lands on ``sum_DP_full / num_rollouts`` — the
@@ -284,6 +287,10 @@ def log_rollout_data(
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",
+                "loss_group_ids",
+                "loss_group_mask_sums",
+                "loss_weights",
+                "loss_stage_ids",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
@@ -316,7 +323,8 @@ def log_rollout_data(
                             total_lengths,
                             response_lengths,
                             loss_masks,
-                            rollout_mask_sums,
+                            sample_denoms,
+                            sample_weights=loss_weights,
                         )
                         # Compute (sum, count) via the shared helper so this
                         # path and the unit tests stay in sync.

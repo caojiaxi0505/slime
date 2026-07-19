@@ -238,11 +238,17 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_data["loss_masks"] = [
             t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["loss_masks"]
         ]
-        if "rollout_mask_sums" in rollout_data:
-            # Promote precomputed per-rollout mask totals to GPU tensors here
-            # (matching loss_masks) so the loss reducer can just divide.
-            rollout_data["rollout_mask_sums"] = rollout_data["rollout_mask_sums"].to(
-                device=device, dtype=torch.float32, non_blocking=True
+        for key in ["rollout_mask_sums", "loss_group_mask_sums", "loss_weights"]:
+            if key in rollout_data:
+                # Promote precomputed reducer coefficients to the training
+                # device once; micro-batches select scalar entries from these
+                # tensors without rebuilding whole-step group statistics.
+                rollout_data[key] = rollout_data[key].to(
+                    device=device, dtype=torch.float32, non_blocking=True
+                )
+        if "loss_stage_ids" in rollout_data:
+            rollout_data["loss_stage_ids"] = rollout_data["loss_stage_ids"].to(
+                device=device, dtype=torch.int64, non_blocking=True
             )
         if "multimodal_train_inputs" in rollout_data:
             # Move multimodal training tensors to GPU in advance

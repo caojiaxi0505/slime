@@ -50,6 +50,7 @@ def get_sum_of_sample_mean(
     loss_masks: list[torch.Tensor],
     sample_denoms: list[torch.Tensor] | torch.Tensor | None = None,
     calculate_per_token_loss: bool = False,
+    sample_weights: list[torch.Tensor | float] | torch.Tensor | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Calculate correct sample mean for CP.
@@ -58,14 +59,20 @@ def get_sum_of_sample_mean(
     sample's denominator is its own ``loss_mask.sum()``. Callers that want a
     per-rollout token-weighted mean pass pre-computed per-sample denominators
     (already as GPU tensors — see actor side) where every sample in the same
-    rollout group carries the same value (the sum of that rollout's mask
-    totals across every sibling sample in the step). Pre-computing at the
-    step level rather than per-mb is required — otherwise a rollout whose
-    samples land in different micro-batches would get a partial denominator
-    on each side.
+    loss group carries the same value (the sum of that episode's mask totals
+    across every compact segment in the step). ``sample_weights`` likewise
+    repeats one episode coefficient on every segment. Pre-computing both at
+    the step level rather than per-mb is required — otherwise an episode
+    whose segments land in different micro-batches would be mis-normalized.
     """
     if sample_denoms is None:
         sample_denoms = [m.sum() for m in loss_masks]
+    if sample_weights is None:
+        sample_weights = [1.0] * len(loss_masks)
+    if len(sample_denoms) != len(loss_masks):
+        raise ValueError(f"sample_denoms has {len(sample_denoms)} entries for {len(loss_masks)} samples")
+    if len(sample_weights) != len(loss_masks):
+        raise ValueError(f"sample_weights has {len(sample_weights)} entries for {len(loss_masks)} samples")
 
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size == 1:
@@ -73,9 +80,9 @@ def get_sum_of_sample_mean(
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum() / torch.clamp_min(denom, 1)
-                    for x_i, loss_mask_i, denom in zip(
-                        x.split(response_lengths, dim=0), loss_masks, sample_denoms, strict=False
+                    weight * (x_i * loss_mask_i).sum() / torch.clamp_min(denom, 1)
+                    for x_i, loss_mask_i, denom, weight in zip(
+                        x.split(response_lengths, dim=0), loss_masks, sample_denoms, sample_weights, strict=True
                     )
                 ]
             )
@@ -83,8 +90,10 @@ def get_sum_of_sample_mean(
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum()
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
+                    weight * (x_i * loss_mask_i).sum()
+                    for x_i, loss_mask_i, weight in zip(
+                        x.split(response_lengths, dim=0), loss_masks, sample_weights, strict=True
+                    )
                 ]
             )
 
@@ -104,9 +113,13 @@ def get_sum_of_sample_mean(
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(denom, 1)
-                    for x_i, chunked_loss_mask, denom in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, sample_denoms, strict=False
+                    weight * (x_i * chunked_loss_mask).sum() / torch.clamp_min(denom, 1)
+                    for x_i, chunked_loss_mask, denom, weight in zip(
+                        x.split(cp_chunk_lengths, dim=0),
+                        chunked_loss_masks,
+                        sample_denoms,
+                        sample_weights,
+                        strict=True,
                     )
                 ]
             )
@@ -114,9 +127,9 @@ def get_sum_of_sample_mean(
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum()
-                    for x_i, chunked_loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=False
+                    weight * (x_i * chunked_loss_mask).sum()
+                    for x_i, chunked_loss_mask, weight in zip(
+                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, sample_weights, strict=True
                     )
                 ]
             )

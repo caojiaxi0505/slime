@@ -104,6 +104,16 @@ class Sample:
     # sibling, so loss aggregation averages within the rollout instead of
     # over-counting it.
     rollout_id: int | None = None
+    # Identity used only by the loss reducer. It is intentionally separate
+    # from ``rollout_id``: the latter remains the outer scheduling unit, while
+    # one compact rollout may contain several independent training episodes.
+    # Segments from the same episode share ``loss_group_id``. ``None`` keeps
+    # the legacy behaviour and falls back to ``rollout_id`` downstream.
+    loss_group_id: str | int | None = None
+    # Explicit coefficient of one loss group in the training objective.
+    # Every compact segment in a group must carry the same value. ``None``
+    # preserves the legacy coefficient of 1.0.
+    loss_weight: float | None = None
     # prompt
     prompt: str | list[dict[str, str]] = ""
     tokens: list[int] = field(default_factory=list)

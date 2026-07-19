@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -1016,30 +1017,83 @@ def policy_loss_function(
 
         # [decouple IS and rejection] Rebuild sum_of_sample_mean with
         # modified_response_masks for numerator correction (rejected tokens
-        # zeroed in pg_loss). Denominators stay the precomputed per-rollout
-        # totals from ``rollout_mask_sums`` (based on original loss_masks) —
-        # same normalizer as the outer reducer, so pg_loss and the rest of the
-        # reported metrics live in the same per-rollout-mean space.
+        # zeroed in pg_loss). Denominators and weights stay the precomputed
+        # whole-episode values based on the original masks, so pg_loss and the
+        # rest of the reported metrics use the same explicit objective.
+        sample_denoms = batch.get("loss_group_mask_sums")
+        if sample_denoms is None:
+            sample_denoms = batch["rollout_mask_sums"]
         sum_of_sample_mean = get_sum_of_sample_mean(
             total_lengths,
             response_lengths,
             modified_response_masks,
-            batch["rollout_mask_sums"],
+            sample_denoms,
             args.calculate_per_token_loss,
+            batch.get("loss_weights"),
         )
+
+    pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+        if batch.get("loss_stage_ids") is not None:
+            raise ValueError(
+                "custom_pg_loss_reducer_function_path is incompatible with the explicit Hybrid loss objective"
+            )
+        loss_weights = batch.get("loss_weights")
+        if loss_weights is not None and any(float(weight) != 1.0 for weight in loss_weights):
+            raise ValueError(
+                "custom_pg_loss_reducer_function_path does not accept explicit loss_weights; "
+                "use the built-in reducer or update the custom reducer contract"
+            )
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
         # Determine which loss_masks to use for pg_loss reducer
-        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
         pg_loss_reducer = custom_pg_loss_reducer_func(
             total_lengths, response_lengths, pg_loss_masks, args.calculate_per_token_loss
         )
     else:
         pg_loss_reducer = sum_of_sample_mean
 
-    pg_loss = pg_loss_reducer(pg_loss)
+    pg_loss_tokens = pg_loss
+    stage_pg_losses: dict[str, torch.Tensor] = {}
+    if batch.get("loss_stage_ids") is not None:
+        sample_denoms = batch.get("loss_group_mask_sums")
+        if sample_denoms is None:
+            sample_denoms = batch["rollout_mask_sums"]
+        base_weights = batch.get("loss_weights")
+        if base_weights is None:
+            base_weights = [1.0] * len(batch["loss_stage_ids"])
+
+        def _stage_weights(stage_id: int):
+            return [
+                weight * (actual_stage == stage_id).to(dtype=torch.float32)
+                for weight, actual_stage in zip(base_weights, batch["loss_stage_ids"], strict=True)
+            ]
+
+        stage1_reducer = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            sample_denoms,
+            sample_weights=_stage_weights(0),
+        )
+        stage2_reducer = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            sample_denoms,
+            sample_weights=_stage_weights(1),
+        )
+        pg_loss_metric_tokens = pg_loss_tokens.detach()
+        stage_pg_losses["pg_loss_stage1"] = stage1_reducer(pg_loss_metric_tokens)
+        stage2_weighted = stage2_reducer(pg_loss_metric_tokens)
+        stage_pg_losses["pg_loss_stage2_weighted"] = stage2_weighted
+        branch_lambda = float(os.environ.get("STEP_GRPO_BRANCH_LOSS_WEIGHT", "1"))
+        stage_pg_losses["pg_loss_stage2"] = (
+            stage2_weighted / branch_lambda if branch_lambda > 0 else stage2_weighted * 0
+        )
+
+    pg_loss = pg_loss_reducer(pg_loss_tokens)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
@@ -1083,6 +1137,7 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
+    reported_loss.update({key: value.clone().detach() for key, value in stage_pg_losses.items()})
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
@@ -1251,14 +1306,24 @@ def loss_function(
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [count, metric1, metric2, ...]).
     """
+    if batch.get("loss_stage_ids") is not None and args.calculate_per_token_loss:
+        raise ValueError(
+            "The explicit Hybrid episode objective requires sample-mean loss; "
+            "disable --calculate-per-token-loss"
+        )
+
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
 
+    sample_denoms = batch.get("loss_group_mask_sums")
+    if sample_denoms is None:
+        sample_denoms = batch["rollout_mask_sums"]
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
         batch["loss_masks"],
-        batch["rollout_mask_sums"],
+        sample_denoms,
         args.calculate_per_token_loss,
+        batch.get("loss_weights"),
     )
 
     match args.loss_type:

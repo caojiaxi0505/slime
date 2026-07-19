@@ -246,7 +246,12 @@ class _AdapterService(metaclass=SingletonMeta):
             },
         )
         self.adapter_url = _adapter_public_url(self.app_handle.port)
-        logger.info("[claudecode_ags] adapter=%s tokenizer=%s", self.adapter_url, args.hf_checkpoint)
+        logger.info(
+            "[claudecode_ags] adapter=%s tokenizer=%s cpu_workers=%d",
+            self.adapter_url,
+            args.hf_checkpoint,
+            self.adapter.cpu_workers,
+        )
 
 
 async def generate(args, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False):
@@ -332,6 +337,21 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any], evalua
             )
 
         segments = await state.adapter.finish_session(session_id)
+        from examples.claudecode_ags.rewards.tool_loop_penalty import adjust_episode_reward
+
+        reward, reward_details, reward_audit = adjust_episode_reward(
+            base_reward=float(reward),
+            reward_details=reward_details,
+            resolved=bool(eval_result.resolved),
+            exit_code=agent_result.get("exit_code"),
+            responses=(
+                state.tokenizer.decode(segment.response_ids, skip_special_tokens=False)
+                for segment in segments
+            ),
+            timeout_outcome_enabled=_env_int("SLIME_CC_TIMEOUT_OUTCOME_REWARD", 0) > 0,
+            tool_loop_enabled=_env_int("SLIME_CC_TOOL_LOOP_PENALTY", 0) > 0,
+        )
+
         total_elapsed = time.time() - t0
         samples = fan_out_sample_segments(
             sample,
@@ -343,6 +363,7 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any], evalua
                 "grading_solved": bool(eval_result.resolved),
                 "applied_cleanly": bool(eval_result.applied_cleanly),
                 "agent_exit_code": agent_result.get("exit_code"),
+                **reward_audit,
                 "reward_details": reward_details,
                 "base_eval": base_eval,
                 "agent_elapsed_sec": agent_elapsed,

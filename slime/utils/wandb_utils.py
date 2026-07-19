@@ -57,6 +57,16 @@ def init_wandb_primary(args):
         "name": run_name,
         "config": _compute_config_for_logging(args),
     }
+    resume_from = os.environ.get("WANDB_RESUME_FROM", "").strip()
+    if resume_from:
+        init_kwargs["resume_from"] = resume_from
+    else:
+        run_id = os.environ.get("WANDB_RUN_ID", "").strip()
+        resume = os.environ.get("WANDB_RESUME", "").strip()
+        if run_id:
+            init_kwargs["id"] = run_id
+        if resume:
+            init_kwargs["resume"] = resume
 
     # Configure settings based on offline/online mode
     if offline:
@@ -84,9 +94,15 @@ def _compute_config_for_logging(args):
 
     whitelist_env_vars = [
         "SLURM_JOB_ID",
-        # We may insert more default values here, and may also allow users to configure a whitelist
+        "STEP_GRPO_HYBRID_K",
+        "STEP_GRPO_FILTER",
+        "STEP_GRPO_BRANCH_LOSS_WEIGHT",
     ]
     output["env_vars"] = {k: v for k, v in os.environ.items() if k in whitelist_env_vars}
+    if os.environ.get("STEP_GRPO_HYBRID_K") is not None:
+        output["step_grpo/hybrid_k"] = int(os.environ["STEP_GRPO_HYBRID_K"])
+    if os.environ.get("STEP_GRPO_BRANCH_LOSS_WEIGHT") is not None:
+        output["step_grpo/branch_loss_weight"] = float(os.environ["STEP_GRPO_BRANCH_LOSS_WEIGHT"])
 
     if getattr(args, "use_critic", False):
         critic_args = _get_role_args_for_logging(args, role="critic")
@@ -96,7 +112,13 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    output = deepcopy(args.__dict__)
+    # Never upload credentials as run configuration. Authentication should be
+    # supplied through WANDB_API_KEY, not a serializable argparse value.
+    for key in ("wandb_key",):
+        if output.get(key) is not None:
+            output[key] = "<redacted>"
+    return output
 
 
 def _prefix_config_keys(config, prefix):
@@ -169,6 +191,12 @@ def _init_wandb_common():
     wandb.define_metric("train/*", step_metric="train/step")
     wandb.define_metric("rollout/step")
     wandb.define_metric("rollout/*", step_metric="rollout/step")
+    # Coding-agent rollout metrics live outside the generic ``rollout/*``
+    # namespace.  Without an explicit step metric W&B plots them against its
+    # internal log-call counter, so one rollout appears to advance several
+    # steps (currently about four) as rollout/train/perf logs are emitted.
+    for namespace in ("outcome", "traj", "behavior", "resume", "task"):
+        wandb.define_metric(f"{namespace}/*", step_metric="rollout/step")
     wandb.define_metric("multi_turn/*", step_metric="rollout/step")
     wandb.define_metric("passrate/*", step_metric="rollout/step")
     wandb.define_metric("eval/step")

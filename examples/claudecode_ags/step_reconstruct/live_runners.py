@@ -9,6 +9,7 @@ import os
 import secrets
 import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -21,13 +22,16 @@ from examples.claudecode_ags.step_reconstruct.edit_ppl import (
 )
 from examples.claudecode_ags.step_reconstruct.session_capture import (
     SessionBundle,
+    atomic_write_text,
+    capture_initial_workspace_metadata,
     capture_snapshots_to_bundle,
     install_snapshot_hook,
 )
+from examples.claudecode_ags.step_reconstruct.native_session import (
+    truncate_native_session_before_tools,
+)
 from examples.claudecode_ags.step_reconstruct.workspace_rebuild import (
     rebuilt_workspace,
-    resume_and_run,
-    truncate_transcript_prefix,
 )
 from slime.agent.sandbox import make_sandbox
 from slime.agent.segment_trajectory import fan_out_sample_segments
@@ -45,13 +49,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _bundle_root(args: Any) -> str:
-    root = (
-        os.environ.get("STEP_GRPO_BUNDLE_DIR")
-        or getattr(args, "save", None)
-        or getattr(args, "load", None)
-        or "/tmp/cc_ags_step_reconstruct"
-    )
-    path = os.path.join(str(root), "step_reconstruct_bundles")
+    explicit = os.environ.get("STEP_GRPO_BUNDLE_DIR")
+    if explicit:
+        path = str(explicit)
+    else:
+        root = getattr(args, "save", None) or getattr(args, "load", None) or "/tmp/cc_ags_step_reconstruct"
+        path = os.path.join(str(root), "step_reconstruct_bundles")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -90,6 +93,32 @@ def _collect_aligned_turn_logprobs(
             n_emitted - len(step_tool_use_ids),
         )
     return aligned
+
+
+def _collect_stage2_alignment_or_disable(adapter, session_id: str, bundle: SessionBundle) -> list[list[float]]:
+    """Keep Stage-1 trainable when reconstruction-only alignment is invalid."""
+    step_ids = [str(step.tool_use_id or "") for step in bundle.steps]
+    try:
+        return _collect_aligned_turn_logprobs(
+            adapter,
+            session_id,
+            step_tool_use_ids=step_ids,
+        )
+    except StepTurnAlignmentError as exc:
+        bundle.transcript_valid = False
+        bundle.transcript_error = str(exc)
+        bundle.save(bundle.dir)
+        logger.warning(
+            "[hybrid-live] Stage-2 disabled but Stage-1 retained: turn/snapshot alignment invalid "
+            "instance=%s session=%s bundle=%s reason=%s",
+            bundle.instance_id,
+            session_id,
+            bundle.dir,
+            exc,
+        )
+        # Preserve the one-entry-per-snapshot shape. Empty logprob rows produce
+        # no edit-PPL candidates even if a caller overlooks transcript_valid.
+        return [[] for _ in bundle.steps]
 
 
 def _shared_rollout_id(base: Sample) -> int:
@@ -134,10 +163,12 @@ async def live_vanilla_runner(
     state = gen._AdapterService(args)
     trial = _trial_sample(sample, trial_idx=trial_idx, base_index=base_index, group_index=group_index)
     session_id = trial.session_id = gen._session_id(trial, f"{instance_id}-t{trial_idx}")
+    cc_session_id = str(uuid.uuid4())
     state.adapter.open_session(
         session_id,
         sampling_defaults=dict(sampling_params or {}),
         max_context_tokens=state.max_context_len,
+        capture_prompt_checkpoints=True,
     )
 
     out_dir = os.path.join(_bundle_root(args), instance_id, f"trial_{trial_idx}_{secrets.token_hex(4)}")
@@ -171,12 +202,15 @@ async def live_vanilla_runner(
                     )
                     await agent_runtime.install_toolchain(sb)
                     await install_snapshot_hook(sb, md["workdir"])
+                    initial_diff = await _common.workspace_diff(sb, md["workdir"])
+                    await capture_initial_workspace_metadata(sb, md["workdir"])
                     agent_result = await agent_runtime.run_claude(
                         sb,
                         workdir=md["workdir"],
                         prompt=md["agent_prompt"],
                         env=claude_env,
                         time_budget_sec=time_budget,
+                        claude_session_id=cc_session_id,
                     )
                     # Prefer HEAD-aligned diff used by snapshot script.
                     final_diff = await _common.workspace_diff(sb, md["workdir"])
@@ -194,6 +228,12 @@ async def live_vanilla_runner(
                         "eval_cmd": md["eval_cmd"],
                         "agent_prompt": md["agent_prompt"],
                     }
+                    exporter = getattr(state.adapter, "export_prompt_checkpoints_async", None)
+                    prompt_checkpoints = (
+                        await exporter(session_id, clear=True) if callable(exporter) else []
+                    )
+                    if not isinstance(prompt_checkpoints, list):
+                        prompt_checkpoints = []
                     bundle = await capture_snapshots_to_bundle(
                         sb,
                         out_dir=out_dir,
@@ -201,9 +241,14 @@ async def live_vanilla_runner(
                         instance_id=instance_id,
                         session_id=session_id,
                         task_metadata=task_md,
+                        initial_diff=initial_diff or "",
                         final_diff=final_diff or "",
+                        transcript_text=str(agent_result.get("trajectory_jsonl") or ""),
                         claude_exit_code=int(agent_result.get("exit_code") or 0),
+                        cc_session_id=cc_session_id,
+                        prompt_checkpoints=prompt_checkpoints,
                     )
+                    del prompt_checkpoints
             agent_elapsed = time.time() - t_agent
 
         # Eval / fan-out outside the agent concurrency slot.
@@ -225,15 +270,29 @@ async def live_vanilla_runner(
         reward_fn = load_function(reward_path)
         base_eval = {"resolved": eval_result.resolved, **eval_result.details}
         reward, reward_details = reward_fn(base_eval=base_eval, sample=trial, args=args)
-        is_solved = bool(eval_result.resolved) or float(reward) == 1.0
         f2p_p2p = gen._f2p_p2p_metrics(base_eval)
 
-        turn_logprobs = _collect_aligned_turn_logprobs(
+        turn_logprobs = _collect_stage2_alignment_or_disable(
             state.adapter,
             session_id,
-            step_tool_use_ids=[str(s.tool_use_id or "") for s in (bundle.steps if bundle else [])],
+            bundle,
         )
         segments = await state.adapter.finish_session(session_id)
+        from examples.claudecode_ags.rewards.tool_loop_penalty import adjust_episode_reward
+
+        reward, reward_details, reward_audit = adjust_episode_reward(
+            base_reward=float(reward),
+            reward_details=reward_details,
+            resolved=bool(eval_result.resolved),
+            exit_code=agent_result.get("exit_code"),
+            responses=(
+                state.tokenizer.decode(segment.response_ids, skip_special_tokens=False)
+                for segment in segments
+            ),
+            timeout_outcome_enabled=gen._env_int("SLIME_CC_TIMEOUT_OUTCOME_REWARD", 0) > 0,
+            tool_loop_enabled=gen._env_int("SLIME_CC_TOOL_LOOP_PENALTY", 0) > 0,
+        )
+        is_solved = bool(eval_result.resolved) or float(reward) == 1.0
         samples = fan_out_sample_segments(
             trial,
             segments,
@@ -246,6 +305,7 @@ async def live_vanilla_runner(
                 "grading_solved": is_solved,
                 "applied_cleanly": bool(eval_result.applied_cleanly),
                 "agent_exit_code": agent_result.get("exit_code"),
+                **reward_audit,
                 "reward_details": reward_details,
                 "base_eval": base_eval,
                 "sample_kind": "vanilla",
@@ -254,6 +314,10 @@ async def live_vanilla_runner(
                 # as separate episodes (see 2026-07-14 vanilla episode-key note).
                 "branch_uid": f"v:{group_index}:t{trial_idx}",
                 "bundle_dir": out_dir,
+                "transcript_valid": bool(bundle.transcript_valid),
+                "transcript_error": str(bundle.transcript_error or ""),
+                "transcript_bytes": int(bundle.transcript_bytes),
+                "transcript_events": int(bundle.transcript_events),
                 "agent_elapsed_sec": agent_elapsed,
                 "agent_queue_wait_sec": queue_wait,
                 "eval_elapsed_sec": eval_elapsed,
@@ -263,13 +327,6 @@ async def live_vanilla_runner(
         )
         if not samples:
             raise RuntimeError("adapter_session_empty")
-
-        # Persist transcript placeholder for prefix reseed (best-effort).
-        transcript_path = os.path.join(out_dir, "transcript.jsonl")
-        if not os.path.isfile(transcript_path):
-            os.makedirs(out_dir, exist_ok=True)
-            with open(transcript_path, "w", encoding="utf-8") as f:
-                f.write("")
 
         logger.info(
             "[hybrid-live] vanilla trial=%d %s reward=%.2f solved=%s steps=%d aligned_turns=%d",
@@ -354,7 +411,8 @@ async def live_branch_runner(
     sampling_params: dict[str, Any],
     bundle: SessionBundle,
     source_trial_idx: int,
-    step_t: int,
+    edit_step_i: int,
+    branch_step_t: int,
     branch_idx: int,
     group_index: int,
     edit_ppl: float,
@@ -372,65 +430,115 @@ async def live_branch_runner(
     state = gen._AdapterService(args)
 
     branch_sample = copy.copy(sample)
-    branch_sample.index = (int(sample.index or 0) * 4096) + 1000 + source_trial_idx * 64 + branch_idx
+    branch_sample.index = (
+        int(sample.index or 0) * 1_000_000_000
+        + 100_000_000
+        + source_trial_idx * 10_000_000
+        + edit_step_i * 1_000
+        + branch_idx
+    )
     branch_sample.group_index = group_index
     branch_sample.rollout_id = _shared_rollout_id(sample)
     branch_sample.session_id = None
     session_id = branch_sample.session_id = gen._session_id(
-        branch_sample, f"{instance_id}-b{source_trial_idx}-{step_t}-{branch_idx}"
+        branch_sample, f"{instance_id}-b{source_trial_idx}-e{edit_step_i}-s{branch_step_t}-{branch_idx}"
     )
-    state.adapter.open_session(
-        session_id,
-        sampling_defaults=dict(sampling_params or {}),
-        max_context_tokens=state.max_context_len,
+    branch_transcript_rel = os.path.join(
+        "branch_runs",
+        f"trial_{source_trial_idx}_edit_{edit_step_i}_branch_{branch_idx}",
+        "transcript.jsonl",
     )
-
     t0 = time.time()
     try:
         # Acquire slot before the per-agent guard so queue wait does not burn
-        # the Claude/eval budget (Stage-2 has large fan-out behind concurrency=64).
+        # the Claude/eval budget. Checkpoint/native state is loaded only after
+        # admission so queued fan-out does not retain hundreds of prompt copies.
         t_queue = time.time()
         async with gen.agent_concurrency_cm():
             queue_wait = time.time() - t_queue
             t_agent = time.time()
             async with asyncio.timeout(guard):
-                async with _workspace_after_submit(bundle, step_t) as (sb, applied):
-                    if not applied:
-                        raise RuntimeError(f"rebuild apply failed t={step_t}")
+                exact_ready, exact_error = bundle.token_exact_readiness(branch_step_t)
+                if not exact_ready:
+                    raise RuntimeError(f"token_exact_bundle_not_ready:{exact_error}")
+                snapshot_ids = [str(step.tool_use_id or "") for step in bundle.steps]
+                if edit_step_i < 0 or edit_step_i >= len(snapshot_ids):
+                    raise IndexError(f"edit_step_i out of range: {edit_step_i}")
+                target_tool_use_id = snapshot_ids[edit_step_i]
+                checkpoint = bundle.checkpoint_for_tool_use_id(target_tool_use_id)
+                if checkpoint is None:
+                    raise RuntimeError(f"missing_prompt_checkpoint_for_tool:{target_tool_use_id}")
+                checkpoint_tool_ids = [
+                    str(value) for value in checkpoint.get("generated_tool_use_ids") or []
+                ]
+                if target_tool_use_id not in checkpoint_tool_ids:
+                    raise RuntimeError(
+                        f"checkpoint_does_not_generate_target_tool:{target_tool_use_id}"
+                    )
+                native_prefix = truncate_native_session_before_tools(
+                    bundle.native_session(),
+                    checkpoint_tool_ids,
+                )
+                await state.adapter.open_session_async(
+                    session_id,
+                    sampling_defaults=dict(sampling_params or {}),
+                    max_context_tokens=state.max_context_len,
+                    resume_checkpoint=checkpoint,
+                )
 
-                    transcript_path = os.path.join(bundle.dir, bundle.transcript_rel)
-                    prefix_text = ""
-                    if os.path.isfile(transcript_path):
-                        with open(transcript_path, encoding="utf-8", errors="replace") as f:
-                            prefix_text = truncate_transcript_prefix(f.read(), step_t)
+                async with _workspace_after_submit(bundle, branch_step_t) as (sb, applied):
+                    if not applied:
+                        raise RuntimeError(f"rebuild apply/verify failed t={branch_step_t}")
 
                     claude_env = gen._build_claude_env(
                         adapter_url=state.adapter_url, session_id=session_id
                     )
                     await agent_runtime.install_toolchain(sb)
-                    prompt = str(md.get("agent_prompt") or gen._DEFAULT_AGENT_PROMPT)
-                    if prefix_text.strip():
-                        agent_result = await resume_and_run(
-                            sb,
-                            workdir=workdir,
-                            prefix_text=prefix_text,
-                            prompt=prompt,
-                            env=claude_env,
-                            time_budget_sec=branch_budget,
-                        )
-                    else:
-                        # No transcript: continue from rebuilt workspace only.
-                        agent_result = await agent_runtime.run_claude(
-                            sb,
-                            workdir=workdir,
-                            prompt=prompt,
-                            env=claude_env,
-                            time_budget_sec=branch_budget,
-                        )
+                    await agent_runtime.ensure_claude_home_writable(sb)
+                    await install_snapshot_hook(sb, workdir)
+                    agent_result = await agent_runtime.run_claude_native_resume(
+                        sb,
+                        workdir=workdir,
+                        env=claude_env,
+                        time_budget_sec=branch_budget,
+                        session_jsonl=native_prefix.jsonl,
+                    )
+                    # Persist the wire transcript before validating resume status.
+                    # Protocol failures are exactly the cases where this artifact
+                    # is most useful; previously it was written only for survivors.
+                    atomic_write_text(
+                        os.path.join(bundle.dir, branch_transcript_rel),
+                        str(agent_result.get("trajectory_jsonl") or ""),
+                    )
 
                     cont_diff = await _common.workspace_diff(sb, workdir)
                     if not (cont_diff or "").strip():
                         cont_diff = await agent_runtime.git_diff(sb, workdir=workdir)
+
+                resume_status = state.adapter.resume_status(session_id)
+                if (
+                    resume_status.get("mode") != "token_exact"
+                    or not resume_status.get("handshake_validated")
+                    or not resume_status.get("first_prompt_exact")
+                    or int(resume_status.get("exact_request_count") or 0) <= 0
+                    or resume_status.get("error")
+                ):
+                    raise RuntimeError(f"token_exact_resume_not_verified:{resume_status}")
+                segments = await state.adapter.finish_session(session_id)
+                if not segments:
+                    logger.warning(
+                        "[hybrid-live] Stage-2 skipped: native token-exact resume produced no new "
+                        "adapter segments instance=%s trial=%d edit=%d branch=%d bundle=%s exit=%s",
+                        instance_id,
+                        source_trial_idx,
+                        edit_step_i,
+                        branch_idx,
+                        bundle.dir,
+                        agent_result.get("exit_code"),
+                    )
+                    raise RuntimeError("token_exact_resume_no_new_adapter_segments")
+                native_target_row_index = native_prefix.target_row_index
+                del checkpoint, native_prefix
             agent_elapsed = time.time() - t_agent
 
         # Eval / fan-out outside the agent concurrency slot.
@@ -458,8 +566,24 @@ async def live_branch_runner(
         )
         f2p_p2p = gen._f2p_p2p_metrics(base_eval)
 
-        segments = await state.adapter.finish_session(session_id)
-        step_group_key = f"{group_index}:{source_trial_idx}:{step_t}"
+        from examples.claudecode_ags.rewards.tool_loop_penalty import adjust_episode_reward
+
+        reward, reward_details, reward_audit = adjust_episode_reward(
+            base_reward=float(reward),
+            reward_details=reward_details,
+            resolved=bool(eval_result.resolved),
+            exit_code=agent_result.get("exit_code"),
+            # Stage-2 is responsible only for its newly generated continuation;
+            # the Stage-1 prefix is intentionally absent from these segments.
+            responses=(
+                state.tokenizer.decode(segment.response_ids, skip_special_tokens=False)
+                for segment in segments
+            ),
+            timeout_outcome_enabled=gen._env_int("SLIME_CC_TIMEOUT_OUTCOME_REWARD", 0) > 0,
+            tool_loop_enabled=gen._env_int("SLIME_CC_TOOL_LOOP_PENALTY", 0) > 0,
+        )
+
+        step_group_key = f"{group_index}:{source_trial_idx}:edit:{edit_step_i}"
         samples = fan_out_sample_segments(
             branch_sample,
             segments,
@@ -470,14 +594,55 @@ async def live_branch_runner(
                 "instance_id": instance_id,
                 "sample_kind": "branch",
                 "source_trial_idx": source_trial_idx,
-                "step_t": step_t,
+                "edit_step_i": edit_step_i,
+                "branch_step_t": branch_step_t,
+                # Compatibility for older metric readers: this is the target edit.
+                "step_t": edit_step_i,
                 "branch_idx": branch_idx,
                 "step_group_key": step_group_key,
                 "edit_ppl": edit_ppl,
                 "branch_uid": f"{step_group_key}:{branch_idx}",
+                "branch_transcript_rel": branch_transcript_rel,
+                "prefix_reseed_mode": "native-session-checkpoint",
+                "prefix_reseed_verified": True,
+                "prompt_checkpoint_id": resume_status["checkpoint_id"],
+                "prompt_sha256": resume_status["first_prompt_sha256"],
+                "prompt_exact": resume_status["first_prompt_exact"],
+                "token_exact_request_count": resume_status["exact_request_count"],
+                "tool_use_echo_mismatch_count": int(
+                    resume_status.get("tool_use_echo_mismatch_count") or 0
+                ),
+                "tool_use_echo_missing_count": int(
+                    resume_status.get("tool_use_echo_missing_count") or 0
+                ),
+                "tool_use_echo_payload_mismatch_count": int(
+                    resume_status.get("tool_use_echo_payload_mismatch_count") or 0
+                ),
+                "runtime_tool_schema_mismatch_count": int(
+                    resume_status.get("runtime_tool_schema_mismatch_count") or 0
+                ),
+                "generated_runtime_tool_unavailable_count": int(
+                    resume_status.get("generated_runtime_tool_unavailable_count") or 0
+                ),
+                "generated_runtime_tool_input_invalid_count": int(
+                    resume_status.get("generated_runtime_tool_input_invalid_count") or 0
+                ),
+                "max_tokens_continuation_count": int(
+                    resume_status.get("max_tokens_continuation_count") or 0
+                ),
+                "post_end_turn_ack_count": int(
+                    resume_status.get("post_end_turn_ack_count") or 0
+                ),
+                "resume_request_replay_count": int(
+                    resume_status.get("request_replay_count") or 0
+                ),
+                "resume_last_stop_reason": str(resume_status.get("last_stop_reason") or ""),
+                "native_session_target_row_index": native_target_row_index,
+                "source_transcript_bytes": int(bundle.transcript_bytes),
                 "grading_solved": bool(eval_result.resolved),
                 "applied_cleanly": bool(eval_result.applied_cleanly),
                 "agent_exit_code": agent_result.get("exit_code"),
+                **reward_audit,
                 "reward_details": reward_details,
                 "base_eval": base_eval,
                 "agent_elapsed_sec": agent_elapsed,
@@ -494,9 +659,10 @@ async def live_branch_runner(
         if not samples:
             raise RuntimeError("branch adapter_session_empty")
         logger.info(
-            "[hybrid-live] branch src=%d t=%d b=%d reward=%.2f segs=%d exit=%s queue=%.1fs agent=%.1fs",
+            "[hybrid-live] branch src=%d edit=%d pre=%d b=%d reward=%.2f segs=%d exit=%s queue=%.1fs agent=%.1fs",
             source_trial_idx,
-            step_t,
+            edit_step_i,
+            branch_step_t,
             branch_idx,
             float(reward),
             len(samples),
