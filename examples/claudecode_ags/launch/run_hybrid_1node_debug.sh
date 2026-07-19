@@ -47,9 +47,12 @@ source "${EXAMPLE_DIR}/env/load_env.sh"
 if [[ -n "${WANDB_FORK_FROM:-}" && -n "${WANDB_RESUME_FROM:-}" ]]; then
   echo "ERROR: WANDB_FORK_FROM and WANDB_RESUME_FROM are mutually exclusive" >&2
   exit 2
-elif [[ -n "${WANDB_FORK_FROM:-}" || -n "${WANDB_RESUME_FROM:-}" ]]; then
-  unset WANDB_RUN_ID WANDB_RESUME
+elif [[ -n "${WANDB_FORK_FROM:-}" ]]; then
+  unset WANDB_RESUME_FROM WANDB_RUN_ID WANDB_RESUME
+elif [[ -n "${WANDB_RESUME_FROM:-}" ]]; then
+  unset WANDB_FORK_FROM WANDB_RUN_ID WANDB_RESUME
 else
+  unset WANDB_FORK_FROM WANDB_RESUME_FROM
   [[ -n "${WANDB_RUN_ID:-}" ]] || unset WANDB_RUN_ID
   [[ -n "${WANDB_RESUME:-}" ]] || unset WANDB_RESUME
 fi
