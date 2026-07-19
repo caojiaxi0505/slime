@@ -128,7 +128,9 @@ WANDB_PROJECT="${WANDB_PROJECT:-coding-rl}"
 WANDB_TEAM="${WANDB_TEAM:-models-tencent7723}"
 WANDB_RESUME_FROM="${WANDB_RESUME_FROM:-}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-}"
-WANDB_RESUME="${WANDB_RESUME:-}"
+# W&B 0.26 validates this environment variable while importing the SDK;
+# an explicitly injected empty string is invalid even when resume_from is used.
+WANDB_RESUME="${WANDB_RESUME:-auto}"
 _load_wandb_key
 WANDB_KEY="${WANDB_KEY:-}"
 # Prefer hybrid EXP_TAG; do not inherit stale GRPO / old-hybrid group from the shell.

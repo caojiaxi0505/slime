@@ -41,6 +41,7 @@ export SLIME_AGENT_AGS_TOOL_ID="sdt-db5nvd67"
 # the final log row for rollout/step=14; the fork therefore starts logging at 15.
 export WANDB_GROUP="${WANDB_GROUP:-${EXP_TAG}}"
 export WANDB_RESUME_FROM="${WANDB_RESUME_FROM:-hy9ro2?_step=59}"
-unset WANDB_RUN_ID WANDB_RESUME
+export WANDB_RESUME="auto"
+unset WANDB_RUN_ID
 
 exec bash "${LAUNCH_DIR}/hybrid_2node_job/submit_job.sh" "$@"
