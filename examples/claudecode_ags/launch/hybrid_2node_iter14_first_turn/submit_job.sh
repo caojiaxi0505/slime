@@ -37,10 +37,11 @@ export SLIME_CC_TOOL_LOOP_PENALTY="1"
 export SLIME_CC_TIMEOUT_OUTCOME_REWARD="1"
 export SLIME_AGENT_AGS_TOOL_ID="sdt-db5nvd67"
 
-# ``hy9ro2`` is the connected Hybrid v9 history. Its W&B internal step 59 is
-# the final log row for rollout/step=14; the fork therefore starts logging at 15.
+# ``w17gn551`` contains an exact replay of ``hy9ro2`` history rows 0..59. Its
+# final row is rollout/step=14, so ordinary W&B resume appends step 15 onward.
 export WANDB_GROUP="${WANDB_GROUP:-${EXP_TAG}}"
-export WANDB_FORK_FROM="${WANDB_FORK_FROM:-hy9ro2?_step=59}"
-unset WANDB_RESUME_FROM WANDB_RESUME WANDB_RUN_ID
+export WANDB_RUN_ID="${WANDB_RUN_ID:-w17gn551}"
+export WANDB_RESUME="${WANDB_RESUME:-must}"
+unset WANDB_FORK_FROM WANDB_RESUME_FROM
 
 exec bash "${LAUNCH_DIR}/hybrid_2node_job/submit_job.sh" "$@"
