@@ -243,6 +243,64 @@ def test_hybrid_branches_k_times_k(tmp_path):
     assert len({s.rollout_id for s in out}) == 1
 
 
+def test_hybrid_filters_over_context_stage2_samples(tmp_path):
+    os.environ["STEP_GRPO_HYBRID_K"] = "2"
+    b0 = _bundle(tmp_path / "a", ["", "diff --git a/a b/a\n+1\n"])
+    b1 = _bundle(tmp_path / "b", ["", "diff --git a/a b/a\n+2\n"])
+
+    async def vanilla_runner(**kwargs):
+        i = kwargs["trial_idx"]
+        bundle = b0 if i == 0 else b1
+        lps = [[], [-1.0]] if i == 0 else [[], [-5.0]]
+        s = _sample(0.0, index=i)
+        return bundle, [s], False, lps
+
+    calls = []
+
+    async def branch_runner(**kwargs):
+        calls.append(kwargs["branch_idx"])
+        s = _sample(0.0, index=100 + len(calls))
+        s.metadata = {
+            "sample_kind": "branch",
+            "step_group_key": f"0:{kwargs['source_trial_idx']}:edit:{kwargs['edit_step_i']}",
+            "source_trial_idx": kwargs["source_trial_idx"],
+            "edit_step_i": kwargs["edit_step_i"],
+            "branch_step_t": kwargs["branch_step_t"],
+            "branch_idx": kwargs["branch_idx"],
+            "edit_ppl": kwargs["edit_ppl"],
+        }
+        if len(calls) % 2:
+            s.tokens = list(range(12))
+            s.response_length = 6
+            s.loss_mask = [1, 1, 0, 0, 1, 1]
+        else:
+            s.tokens = list(range(8))
+            s.response_length = 4
+            s.loss_mask = [1, 0, 1, 0]
+        return [s]
+
+    out = asyncio.run(
+        hybrid_generate(
+            SimpleNamespace(rollout_max_context_len=10),
+            _sample(),
+            {},
+            vanilla_runner=vanilla_runner,
+            branch_runner=branch_runner,
+        )
+    )
+    branches = [s for s in out if s.metadata["sample_kind"] == "branch"]
+    assert len(branches) == 2
+    assert all(len(s.tokens) <= 10 for s in branches)
+    assert len(calls) == 4
+    assert all(s.metadata["hybrid_num_stage2_samples_before_length_filter"] == 4 for s in out)
+    assert all(s.metadata["hybrid_num_stage2_samples_after_length_filter"] == 2 for s in out)
+    assert all(s.metadata["hybrid_num_stage2_samples_dropped_over_context"] == 2 for s in out)
+    assert all(s.metadata["hybrid_stage2_context_limit_tokens"] == 10 for s in out)
+    assert all(s.metadata["hybrid_stage2_max_total_tokens"] == 12 for s in out)
+    assert all(s.metadata["hybrid_stage2_max_response_tokens"] == 6 for s in out)
+    assert all(s.metadata["hybrid_stage2_max_loss_tokens"] == 4 for s in out)
+
+
 def test_hybrid_partial_trial_failure_keeps_grpo_slot(tmp_path):
     os.environ["STEP_GRPO_HYBRID_K"] = "2"
     bundle = _bundle(tmp_path, ["", "diff --git a/a b/a\n+1\n"])

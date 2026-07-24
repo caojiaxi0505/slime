@@ -70,19 +70,34 @@ spec:
                   value: ${EXP_TAG}
                 - name: LOG_DIR
                   value: ${LOG_DIR}
+                - name: LOAD_PATH
+                  value: ${LOAD_PATH}
+                - name: SAVE_PATH
+                  value: ${SAVE_PATH}
+                - name: RUN_ROOT
+                  value: ${RUN_ROOT}
+                - name: LOAD_CKPT_STEP
+                  value: "${LOAD_CKPT_STEP}"
+                - name: RESUME_DEBUG_ROLLOUT_DATA
+                  value: "${RESUME_DEBUG_ROLLOUT_DATA}"
                 - name: PHASE
                   value: ${PHASE}
-                - name: WANDB_API_KEY
-                  valueFrom:
-                    secretKeyRef:
-                      name: ${WANDB_SECRET_NAME}
-                      key: ${WANDB_SECRET_KEY}
+                - name: WANDB_KEY
+                  value: ${WANDB_KEY}
                 - name: WANDB_PROJECT
                   value: ${WANDB_PROJECT}
                 - name: WANDB_GROUP
                   value: ${WANDB_GROUP}
                 - name: WANDB_TEAM
                   value: ${WANDB_TEAM}
+                - name: WANDB_FORK_FROM
+                  value: ${WANDB_FORK_FROM}
+                - name: WANDB_RESUME_FROM
+                  value: ${WANDB_RESUME_FROM}
+                - name: WANDB_RUN_ID
+                  value: ${WANDB_RUN_ID}
+                - name: WANDB_RESUME
+                  value: ${WANDB_RESUME}
                 - name: SLIME_ADAPTER_PUBLIC_URL
                   value: ${SLIME_ADAPTER_PUBLIC_URL}
                 - name: ANTHROPIC_BASE_URL
@@ -127,8 +142,12 @@ spec:
                   value: "${STEP_GRPO_PPL_CLIP}"
                 - name: STEP_GRPO_FILTER
                   value: "${STEP_GRPO_FILTER}"
+                - name: STEP_GRPO_STAGE1_LOSS_WEIGHT
+                  value: "${STEP_GRPO_STAGE1_LOSS_WEIGHT}"
                 - name: STEP_GRPO_BRANCH_LOSS_WEIGHT
                   value: "${STEP_GRPO_BRANCH_LOSS_WEIGHT}"
+                - name: STEP_GRPO_STAGE2_LOSS_SCOPE
+                  value: "${STEP_GRPO_STAGE2_LOSS_SCOPE}"
                 - name: STEP_GRPO_BUNDLE_DIR
                   value: ${STEP_GRPO_BUNDLE_DIR}
                 - name: NNODES
@@ -177,13 +196,21 @@ spec:
                 - name: SLIME_AGENT_COS_CC_PACKAGE
                   value: "cc-prefix-2.1.104-linux-x64.tar.gz"
                 - name: SLIME_CC_TIME_BUDGET_SEC
-                  value: "1800"
+                  value: "${SLIME_CC_TIME_BUDGET_SEC}"
                 - name: SLIME_CC_EVAL_TIMEOUT_SEC
                   value: "600"
+                - name: STEP_GRPO_BRANCH_BUDGET_SEC
+                  value: "${SLIME_CC_TIME_BUDGET_SEC}"
+                - name: SLIME_CC_AGENT_CONCURRENCY
+                  value: "${SLIME_CC_AGENT_CONCURRENCY}"
+                - name: SLIME_CC_TOOL_LOOP_PENALTY
+                  value: "${SLIME_CC_TOOL_LOOP_PENALTY}"
+                - name: SLIME_CC_TIMEOUT_OUTCOME_REWARD
+                  value: "${SLIME_CC_TIMEOUT_OUTCOME_REWARD}"
                 - name: SLIME_AGENT_AGS_TIMEOUT
-                  value: "45m"
+                  value: "75m"
                 - name: SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC
-                  value: "2700"
+                  value: "4500"
                 - name: SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC
                   value: "600"
                 - name: PATH

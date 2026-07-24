@@ -133,6 +133,7 @@ export STEP_GRPO_BRANCH_SUBMIT_BATCH="${STEP_GRPO_BRANCH_SUBMIT_BATCH:-${STEP_GR
 export STEP_GRPO_BRANCH_CONCURRENCY="${STEP_GRPO_BRANCH_SUBMIT_BATCH}"
 export STEP_GRPO_PPL_CLIP="${STEP_GRPO_PPL_CLIP:-20}"
 export STEP_GRPO_FILTER="${STEP_GRPO_FILTER:-1}"
+export STEP_GRPO_STAGE1_LOSS_WEIGHT="${STEP_GRPO_STAGE1_LOSS_WEIGHT:-1.0}"
 export STEP_GRPO_BRANCH_LOSS_WEIGHT="${STEP_GRPO_BRANCH_LOSS_WEIGHT:-1.0}"
 export STEP_GRPO_STAGE2_LOSS_SCOPE="${STEP_GRPO_STAGE2_LOSS_SCOPE:-full_continuation}"
 
@@ -528,7 +529,7 @@ mkdir -p \
 
 # Safe, reproducible run manifest. Credentials are intentionally absent.
 python3 - "${LOG_DIR}/run_manifest.json" "${EXP_TAG}" "${STEP_GRPO_HYBRID_K}" \
-  "${STEP_GRPO_FILTER}" "${STEP_GRPO_BRANCH_LOSS_WEIGHT}" "${ROLLOUT_BATCH_SIZE}" \
+  "${STEP_GRPO_FILTER}" "${STEP_GRPO_STAGE1_LOSS_WEIGHT}" "${STEP_GRPO_BRANCH_LOSS_WEIGHT}" "${ROLLOUT_BATCH_SIZE}" \
   "${GLOBAL_BATCH_SIZE}" "${STEP_GRPO_BUNDLE_DIR}" "${SLIME_CC_TIME_BUDGET_SEC}" \
   "${STEP_GRPO_BRANCH_BUDGET_SEC}" "${STEP_GRPO_STAGE2_LOSS_SCOPE}" "${LOAD_PATH}" \
   "${LOAD_CKPT_STEP}" "${SAVE_PATH}" <<'PY'
@@ -542,6 +543,7 @@ import sys
     exp_tag,
     hybrid_k,
     filter_enabled,
+    stage1_weight,
     branch_weight,
     rollout_batch_size,
     global_batch_size,
@@ -569,6 +571,7 @@ manifest = {
     "stage2_loss_scope": stage2_loss_scope,
     "step_grpo_hybrid_k": int(hybrid_k),
     "step_grpo_filter": filter_enabled not in {"0", "false", "False"},
+    "step_grpo_stage1_loss_weight": float(stage1_weight),
     "step_grpo_branch_loss_weight": float(branch_weight),
     "rollout_batch_size": int(rollout_batch_size),
     "global_batch_size": int(global_batch_size),

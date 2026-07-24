@@ -367,6 +367,13 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
             "hybrid_num_patch_candidates": 2,
             "hybrid_num_selected_edits": 1,
             "hybrid_num_branch_tasks": 8,
+            "hybrid_num_stage2_samples_before_length_filter": 10,
+            "hybrid_num_stage2_samples_after_length_filter": 8,
+            "hybrid_num_stage2_samples_dropped_over_context": 2,
+            "hybrid_stage2_context_limit_tokens": 131072,
+            "hybrid_stage2_max_total_tokens": 140000,
+            "hybrid_stage2_max_response_tokens": 20000,
+            "hybrid_stage2_max_loss_tokens": 12000,
             "hybrid_num_dropped_branches": 2,
             "hybrid_num_dropped_timeout": 0,
             "hybrid_num_dropped_resume_tool_echo": 1,
@@ -441,6 +448,14 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
     assert m["perf/step_grpo/stage1_aborted_placeholder_rate"] == 0.25
     assert m["perf/step_grpo/n_patch_candidates"] == 2.0
     assert m["perf/step_grpo/n_branch_tasks"] == 8.0
+    assert m["perf/step_grpo/n_stage2_samples_before_length_filter"] == 10.0
+    assert m["perf/step_grpo/n_stage2_samples_after_length_filter"] == 8.0
+    assert m["perf/step_grpo/n_stage2_samples_dropped_over_context"] == 2.0
+    assert m["perf/step_grpo/stage2_over_context_sample_rate"] == 0.2
+    assert m["perf/step_grpo/stage2_context_limit_tokens"] == 131072.0
+    assert m["perf/step_grpo/stage2_max_total_tokens_before_length_filter"] == 140000.0
+    assert m["perf/step_grpo/stage2_max_response_tokens_before_length_filter"] == 20000.0
+    assert m["perf/step_grpo/stage2_max_loss_tokens_before_length_filter"] == 12000.0
     assert m["perf/step_grpo/n_dropped_branches"] == 2.0
     assert m["perf/step_grpo/n_completed_branches"] == 6.0
     assert m["perf/step_grpo/branch_completion_rate"] == 0.75

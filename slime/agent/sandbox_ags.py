@@ -18,6 +18,7 @@ Optional: ``SLIME_AGENT_AGS_TOOL_ID`` (empty → create a new SandboxTool),
 ``SLIME_AGENT_AGS_CPU``, ``SLIME_AGENT_AGS_MEMORY``,
 ``SLIME_AGENT_AGS_TIMEOUT``, ``SLIME_AGENT_AGS_PORT``,
 ``SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC``, ``SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC``,
+``SLIME_AGENT_AGS_MAX_RETRIES``, ``SLIME_AGENT_AGS_RETRY_DELAYS_SEC``,
 ``SLIME_AGENT_AGS_IMAGE_REGISTRY_TYPE``, mount-related ``SLIME_AGENT_AGS_MOUNT_*`` /
 ``SLIME_AGENT_AGS_IMAGE_SUBPATH``, and ``SLIME_AGENT_AGS_SWE_REX_ROOT`` (sys.path
 for SWE-ReX).
@@ -25,17 +26,30 @@ for SWE-ReX).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
+import random
 import shlex
 import sys
+import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
+
+import aiohttp
 
 from slime.agent.sandbox import ExecResult, FileContent
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+_DEFAULT_MAX_RETRIES = 5
+_DEFAULT_RETRY_DELAYS_SEC = (15.0, 30.0, 60.0)
+_DEFAULT_RETRY_JITTER_RATIO = 0.1
+_DEFAULT_RETRY_JITTER_MAX_SEC = 5.0
 
 _REQUIRED_KEYS = (
     "SLIME_AGENT_AGS_SECRET_ID",
@@ -95,6 +109,77 @@ def _optional(name: str, default: str) -> str:
     return (os.environ.get(name) or "").strip() or default
 
 
+def _retry_count() -> int:
+    raw = _optional("SLIME_AGENT_AGS_MAX_RETRIES", str(_DEFAULT_MAX_RETRIES))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Invalid SLIME_AGENT_AGS_MAX_RETRIES=%r; using %d", raw, _DEFAULT_MAX_RETRIES)
+        return _DEFAULT_MAX_RETRIES
+
+
+def _retry_delays() -> tuple[float, ...]:
+    raw = _optional("SLIME_AGENT_AGS_RETRY_DELAYS_SEC", "15,30,60")
+    try:
+        delays = tuple(float(value.strip()) for value in raw.split(",") if value.strip())
+        if not delays or any(value < 0 for value in delays):
+            raise ValueError
+        return delays
+    except ValueError:
+        logger.warning(
+            "Invalid SLIME_AGENT_AGS_RETRY_DELAYS_SEC=%r; using 15,30,60",
+            raw,
+        )
+        return _DEFAULT_RETRY_DELAYS_SEC
+
+
+def _is_transient_request_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            asyncio.TimeoutError,
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+        ),
+    ):
+        return True
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status in {408, 425, 429, 500, 502, 503, 504}
+    return False
+
+
+async def _retry_transient_request(
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    max_retries: int,
+    delays: tuple[float, ...],
+    description: str,
+) -> _T:
+    """Retry transient transport failures; the operation owns request identity."""
+    for attempt in range(max_retries + 1):
+        try:
+            return await operation()
+        except BaseException as exc:
+            if not _is_transient_request_error(exc) or attempt >= max_retries:
+                raise
+            base_delay = delays[min(attempt, len(delays) - 1)]
+            jitter = random.uniform(
+                0.0,
+                min(_DEFAULT_RETRY_JITTER_MAX_SEC, base_delay * _DEFAULT_RETRY_JITTER_RATIO),
+            )
+            sleep_sec = base_delay + jitter
+            logger.warning(
+                "[agent.sandbox_ags] transient %s failure; retry %d/%d in %.1fs: %s",
+                description,
+                attempt + 1,
+                max_retries,
+                sleep_sec,
+                exc,
+            )
+            await asyncio.sleep(sleep_sec)
+    raise AssertionError("unreachable")
+
+
 class AGSSandbox:
     """Async sandbox backed by Tencent AGS through SWE-ReX."""
 
@@ -103,6 +188,7 @@ class AGSSandbox:
         self.sandbox_id = ""
         self._deployment: Any = None
         self._rex_command_cls: Any = None
+        self._rex_command_response_cls: Any = None
 
     @staticmethod
     def _import_swerex():
@@ -112,12 +198,13 @@ class AGSSandbox:
         try:
             from swerex.deployment.config import TencentAGSDeploymentConfig, get_deployment
             from swerex.runtime.abstract import Command as RexCommand
+            from swerex.runtime.abstract import CommandResponse as RexCommandResponse
         except ImportError as e:
             raise RuntimeError(
                 "Failed to import SWE-ReX AGS runtime. "
                 "Install SWE-ReX or set SLIME_AGENT_AGS_SWE_REX_ROOT to its src/ path."
             ) from e
-        return TencentAGSDeploymentConfig, get_deployment, RexCommand
+        return TencentAGSDeploymentConfig, get_deployment, RexCommand, RexCommandResponse
 
     def _deployment_kwargs(self, required: dict[str, str]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -151,8 +238,9 @@ class AGSSandbox:
 
     async def __aenter__(self) -> AGSSandbox:
         required = _require_ags_env()
-        config_cls, get_deployment, rex_command_cls = self._import_swerex()
+        config_cls, get_deployment, rex_command_cls, rex_command_response_cls = self._import_swerex()
         self._rex_command_cls = rex_command_cls
+        self._rex_command_response_cls = rex_command_response_cls
         self._deployment = get_deployment(config_cls(**self._deployment_kwargs(required)))
         await self._deployment.start()
         self.sandbox_id = str(
@@ -190,10 +278,11 @@ class AGSSandbox:
         check: bool = False,
         idempotent: bool = True,
     ) -> ExecResult:
-        # ``idempotent`` is accepted for Sandbox protocol parity with E2B
-        # (used by ``run_agent``); AGS does not retry on this flag today.
-        _ = idempotent
-        if self._deployment is None or self._rex_command_cls is None:
+        if (
+            self._deployment is None
+            or self._rex_command_cls is None
+            or self._rex_command_response_cls is None
+        ):
             raise RuntimeError("AGSSandbox is not started")
 
         # SWE-ReX HTTP client timeout is independent of Command.timeout.
@@ -206,22 +295,50 @@ class AGSSandbox:
         if current < needed:
             os.environ["SWEREX_REQUEST_TIMEOUT"] = str(needed)
 
-        full_cmd = self._wrap_cmd(cmd, user=user, env=env)
-        res = await self._deployment.runtime.execute(
-            self._rex_command_cls(
-                command=full_cmd,
-                shell=True,
-                check=False,
-                timeout=timeout,
-                merge_output_streams=False,
-            )
+        command = self._rex_command_cls(
+            command=self._wrap_cmd(cmd, user=user, env=env),
+            shell=True,
+            check=False,
+            timeout=timeout,
+            merge_output_streams=False,
         )
+        if idempotent and _retry_count() > 0:
+            res = await self._execute_idempotent_with_retry(command)
+        else:
+            res = await self._deployment.runtime.execute(command)
         exit_code = int(getattr(res, "exit_code", 0))
         stdout = getattr(res, "stdout", "") or ""
         stderr = getattr(res, "stderr", "") or ""
         if check and exit_code != 0:
             raise RuntimeError(f"ags exec failed (exit={exit_code}): {cmd[:120]}\n{stderr[:400]}")
         return exit_code, stdout, stderr
+
+    async def _execute_idempotent_with_retry(self, command: Any) -> Any:
+        """Call AGS ``/execute`` with one request ID across all retry attempts."""
+        runtime = self._deployment.runtime
+        request_id = str(uuid.uuid4())
+
+        async def request_once() -> Any:
+            ensure_token = getattr(runtime, "_ensure_valid_token", None)
+            if callable(ensure_token):
+                await ensure_token()
+            headers = dict(runtime._headers)
+            headers["X-Request-ID"] = request_id
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=True)) as session:
+                async with session.post(
+                    f"{runtime._api_url}/execute",
+                    json=command.model_dump(),
+                    headers=headers,
+                ) as response:
+                    await runtime._handle_response_errors(response)
+                    return self._rex_command_response_cls(**await response.json())
+
+        return await _retry_transient_request(
+            request_once,
+            max_retries=_retry_count(),
+            delays=_retry_delays(),
+            description="AGS /execute",
+        )
 
     async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None:
         if isinstance(content, Path):

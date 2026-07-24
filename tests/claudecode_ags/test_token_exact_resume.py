@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 from unittest.mock import patch
 
 import pytest
@@ -105,6 +106,60 @@ def test_prompt_checkpoint_roundtrip_and_hash_is_stable():
     assert PromptCheckpoint.from_dict(checkpoint.to_dict()).to_dict() == checkpoint.to_dict()
     assert prompt_ids_sha256([1, 2, 3]) == prompt_ids_sha256([1, 2, 3])
     assert prompt_ids_sha256([1, 2, 3]) != prompt_ids_sha256([3, 2, 1])
+
+
+def test_sft_turn_logger_writes_real_request_response_context(tmp_path, monkeypatch):
+    async def run_case():
+        monkeypatch.setenv("SLIME_AGENT_SFT_LOG_DIR", str(tmp_path))
+        reply = "I will inspect the file."
+        async with FakeSGLangServer([[(-0.1, 701)]]) as sglang:
+            tokenizer = FakeTokenizer(outputs={(701,): reply})
+            adapter = SegmentedAnthropicAdapter(tokenizer=tokenizer, sglang_url=sglang.url)
+            adapter.open_session(
+                "sft-session",
+                sampling_defaults={"temperature": 1.0},
+                max_context_tokens=4096,
+            )
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sft-session"},
+                    json={
+                        "model": "m",
+                        "max_tokens": 16,
+                        "tools": TOOLS,
+                        "system": "stable system",
+                        "messages": [{"role": "user", "content": "fix the bug"}],
+                    },
+                )
+                assert response.status == 200
+                await response.json()
+            finally:
+                await client.close()
+            await adapter.finish_session("sft-session")
+
+        files = list(tmp_path.glob("*.sft_turns.jsonl"))
+        assert len(files) == 1
+        rows = [json.loads(line) for line in files[0].read_text().splitlines()]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["session_id_sha256"]
+        assert "session_id" not in row
+        assert row["request_kind"] == "new"
+        assert row["prompt"]["messages"][0]["role"] == "system"
+        assert row["prompt"]["messages"][0]["content"] == "stable system"
+        assert row["prompt"]["tools_schema"]
+        assert row["prompt"]["generation_config"]["request"]["max_tokens"] == 16
+        assert row["prompt"]["prompt_token_count"] == len(sglang.requests[0]["input_ids"])
+        assert row["response"]["raw_output_text"] == reply
+        assert row["response"]["message"]["role"] == "assistant"
+        assert row["response"]["message"]["content"] == reply
+        assert "prompt_ids" not in row["prompt"]
+        assert "output_ids" not in row["response"]
+
+    asyncio.run(run_case())
 
 
 def test_async_resume_session_validation_uses_cpu_executor():

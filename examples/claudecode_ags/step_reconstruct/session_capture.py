@@ -38,6 +38,8 @@ import subprocess
 import sys
 
 VERSION = 1
+PATH_KEYS = {"file_path", "path", "notebook_path"}
+READ_ONLY_EXTERNAL_PATH_TOOLS = {"Read"}
 
 
 def _inside(workdir, value):
@@ -70,19 +72,37 @@ def _ignored_inside(workdir, value):
     return rel in {".git", ".harness"} or rel.startswith(".git/") or rel.startswith(".harness/")
 
 
+def _payload_tool_name(payload):
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("tool_name", "name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key in ("tool_use", "tool"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            nested = _payload_tool_name(value)
+            if nested:
+                return nested
+    return ""
+
+
 def _payload_paths(workdir, payload_path):
     try:
         with open(payload_path, encoding="utf-8") as handle:
             payload = json.load(handle)
     except Exception:
-        return set(), set()
+        return set(), set(), set()
     found = set()
     unsupported = set()
+    external_reads = set()
+    tool_name = _payload_tool_name(payload)
 
     def walk(value):
         if isinstance(value, dict):
             for key, child in value.items():
-                if key in {"file_path", "path", "notebook_path"}:
+                if key in PATH_KEYS:
                     rel = _inside(workdir, child)
                     if rel:
                         found.add(rel)
@@ -91,14 +111,17 @@ def _payload_paths(workdir, payload_path):
                         and child.strip()
                         and not _ignored_inside(workdir, child)
                     ):
-                        unsupported.add(child)
+                        if tool_name in READ_ONLY_EXTERNAL_PATH_TOOLS:
+                            external_reads.add(child)
+                        else:
+                            unsupported.add(child)
                 walk(child)
         elif isinstance(value, list):
             for child in value:
                 walk(child)
 
     walk(payload)
-    return found, unsupported
+    return found, unsupported, external_reads
 
 
 def _git_paths(workdir):
@@ -143,7 +166,9 @@ def capture(workdir, output_path, payload_path, tracked_path):
     workdir = os.path.abspath(workdir)
     tracked = {"PROBLEM_STATEMENT.md"}
     unsupported_tracked_path = tracked_path + ".unsupported"
+    external_read_tracked_path = tracked_path + ".external_reads"
     unsupported_tracked = set()
+    external_read_tracked = set()
     try:
         with open(tracked_path, encoding="utf-8") as handle:
             tracked.update(json.load(handle))
@@ -154,15 +179,23 @@ def capture(workdir, output_path, payload_path, tracked_path):
             unsupported_tracked.update(json.load(handle))
     except Exception:
         pass
-    payload_paths, unsupported_paths = _payload_paths(workdir, payload_path)
+    try:
+        with open(external_read_tracked_path, encoding="utf-8") as handle:
+            external_read_tracked.update(json.load(handle))
+    except Exception:
+        pass
+    payload_paths, unsupported_paths, external_read_paths = _payload_paths(workdir, payload_path)
     tracked.update(payload_paths)
     unsupported_tracked.update(unsupported_paths)
+    external_read_tracked.update(external_read_paths)
     tracked.update(_git_paths(workdir))
     os.makedirs(os.path.dirname(tracked_path), exist_ok=True)
     with open(tracked_path, "w", encoding="utf-8") as handle:
         json.dump(sorted(tracked), handle, separators=(",", ":"))
     with open(unsupported_tracked_path, "w", encoding="utf-8") as handle:
         json.dump(sorted(unsupported_tracked), handle, separators=(",", ":"))
+    with open(external_read_tracked_path, "w", encoding="utf-8") as handle:
+        json.dump(sorted(external_read_tracked), handle, separators=(",", ":"))
 
     records = []
     for rel in sorted(tracked):
@@ -194,6 +227,7 @@ def capture(workdir, output_path, payload_path, tracked_path):
                 "workdir": workdir,
                 "records": records,
                 "unsupported_paths": sorted(unsupported_tracked),
+                "external_read_paths": sorted(external_read_tracked),
             },
             handle,
             separators=(",", ":"),

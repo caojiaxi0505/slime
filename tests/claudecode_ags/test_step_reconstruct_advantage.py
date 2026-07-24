@@ -211,6 +211,37 @@ def test_loss_weights_equalize_episodes_and_edit_groups(monkeypatch):
     assert [s.loss_weight for s in samples[3:]] == [0.5, 0.5, 1.0]
 
 
+def test_stage1_loss_weight_can_disable_vanilla_training(monkeypatch):
+    monkeypatch.setenv("STEP_GRPO_FILTER", "0")
+    monkeypatch.setenv("STEP_GRPO_STAGE1_LOSS_WEIGHT", "0")
+    monkeypatch.setenv("STEP_GRPO_BRANCH_LOSS_WEIGHT", "1")
+    samples = [
+        _s(group_index=0, index=10, reward=1.0, kind="vanilla", trial_idx=0),
+        _s(group_index=0, index=11, reward=0.0, kind="vanilla", trial_idx=1),
+        _s(
+            group_index=0,
+            index=20,
+            reward=1.0,
+            kind="branch",
+            step_group_key="0:0:edit:2",
+            branch_uid="0:0:edit:2:0",
+        ),
+        _s(
+            group_index=0,
+            index=21,
+            reward=0.0,
+            kind="branch",
+            step_group_key="0:0:edit:2",
+            branch_uid="0:0:edit:2:1",
+        ),
+    ]
+
+    filter(SimpleNamespace(), samples)
+
+    assert [s.loss_weight for s in samples[:2]] == [0.0, 0.0]
+    assert [s.loss_weight for s in samples[2:]] == [0.5, 0.5]
+
+
 def test_zero_token_vanilla_slot_keeps_fixed_group_weight(monkeypatch):
     monkeypatch.setenv("STEP_GRPO_FILTER", "0")
     samples = [

@@ -119,6 +119,71 @@ def test_workspace_metadata_ignores_internal_harness_paths(tmp_path):
     assert all(not row["path"].startswith(".harness") for row in data["records"])
 
 
+def test_workspace_metadata_allows_external_read_paths_as_audit_only(tmp_path):
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    (workdir / "PROBLEM_STATEMENT.md").write_text("bug\n")
+    external = tmp_path / "outside.txt"
+    external.write_text("outside\n")
+    script = tmp_path / "metadata.py"
+    script.write_text(_WORKSPACE_METADATA_SCRIPT)
+    payload = tmp_path / "payload.json"
+    payload.write_text(
+        json.dumps({"tool_name": "Read", "tool_input": {"file_path": str(external)}})
+    )
+    manifest = tmp_path / "manifest.json"
+    tracked = tmp_path / "tracked.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "capture",
+            str(workdir),
+            str(manifest),
+            str(payload),
+            str(tracked),
+        ],
+        check=True,
+    )
+
+    data = json.loads(manifest.read_text())
+    assert data["unsupported_paths"] == []
+    assert data["external_read_paths"] == [str(external)]
+
+
+def test_workspace_metadata_blocks_external_write_paths(tmp_path):
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    (workdir / "PROBLEM_STATEMENT.md").write_text("bug\n")
+    external = tmp_path / "outside.txt"
+    script = tmp_path / "metadata.py"
+    script.write_text(_WORKSPACE_METADATA_SCRIPT)
+    payload = tmp_path / "payload.json"
+    payload.write_text(
+        json.dumps({"tool_name": "Write", "tool_input": {"file_path": str(external)}})
+    )
+    manifest = tmp_path / "manifest.json"
+    tracked = tmp_path / "tracked.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "capture",
+            str(workdir),
+            str(manifest),
+            str(payload),
+            str(tracked),
+        ],
+        check=True,
+    )
+
+    data = json.loads(manifest.read_text())
+    assert data["unsupported_paths"] == [str(external)]
+    assert data["external_read_paths"] == []
+
+
 def test_apply_diff_empty_ok():
     sb = _FakeSB()
     assert asyncio.run(apply_diff(sb, "/testbed", "")) is True

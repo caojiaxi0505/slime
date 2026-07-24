@@ -138,6 +138,7 @@ def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
     episodes within each group are equal-weighted. Compact segments inherit
     the weight of their episode.
     """
+    stage1_weight = _env_float("STEP_GRPO_STAGE1_LOSS_WEIGHT", 1.0)
     branch_lambda = _env_float("STEP_GRPO_BRANCH_LOSS_WEIGHT", 1.0)
     episode_members: dict[tuple[Any, str, Any], list[Sample]] = defaultdict(list)
     for s in flat:
@@ -196,7 +197,7 @@ def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
                 f"outer Stage-1 group {outer!r} has {len(keys)} episode slots, "
                 f"expected {next(iter(declared_sizes))}"
             )
-        weight = 1.0 / len(keys)
+        weight = stage1_weight / len(keys)
         for key in keys:
             _set_episode_weight(key, weight)
 

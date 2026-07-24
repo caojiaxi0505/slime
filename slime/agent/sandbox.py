@@ -65,13 +65,23 @@ async def _await_done_marker(sb: Sandbox, done_file: str, *, user: str, time_bud
     """Poll a detached command's exit-code marker until it appears, returning the
     exit code (or ``EXIT_TIME_BUDGET_EXCEEDED`` if the budget runs out first).
 
-    The 5s ``test -f && cat`` polls are deliberately short, idempotent RPCs --
+    The 15s ``test -f && cat`` polls are deliberately short, idempotent RPCs --
     they keep the sandbox alive against idle GC while the detached command runs
     over a stream the gateway can't sever.
     """
+    raw_poll_interval = os.environ.get("SLIME_AGENT_DONE_POLL_INTERVAL_SEC", "15")
+    try:
+        poll_interval = max(0.1, float(raw_poll_interval))
+    except ValueError:
+        logger.warning(
+            "Invalid SLIME_AGENT_DONE_POLL_INTERVAL_SEC=%r; using 15 seconds",
+            raw_poll_interval,
+        )
+        poll_interval = 15.0
+
     deadline = time.time() + time_budget_sec
     while time.time() < deadline:
-        await asyncio.sleep(5)
+        await asyncio.sleep(min(poll_interval, max(0.0, deadline - time.time())))
         ec, out, _ = await sb.exec(f"test -f {done_file} && cat {done_file}", user=user, timeout=15, check=False)
         if ec == 0 and (out or "").strip():
             return int(out.strip())

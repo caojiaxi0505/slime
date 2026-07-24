@@ -78,6 +78,31 @@ def _shared_rollout_id(sample: Sample) -> int:
     return int(sample.index or 0)
 
 
+def _stage2_train_context_limit(args) -> int:
+    """Total-token limit for Stage-2 samples before handing them to Megatron."""
+    for name in ("rollout_max_context_len", "max_context_len"):
+        value = getattr(args, name, None)
+        if value is not None:
+            return max(0, int(value))
+    return max(0, _env_int("ROLLOUT_MAX_CONTEXT_LEN", 0))
+
+
+def _sample_total_tokens(sample: Sample) -> int:
+    tokens = getattr(sample, "tokens", None)
+    return len(tokens) if tokens is not None else 0
+
+
+def _sample_response_tokens(sample: Sample) -> int:
+    return int(getattr(sample, "response_length", 0) or 0)
+
+
+def _sample_loss_tokens(sample: Sample) -> int:
+    mask = getattr(sample, "loss_mask", None)
+    if mask is None:
+        return _sample_response_tokens(sample)
+    return sum(int(value) for value in mask)
+
+
 def _stamp_shared_rollout_id(samples: list[Sample], parent: Sample) -> list[Sample]:
     rid = _shared_rollout_id(parent)
     for s in samples:
@@ -113,7 +138,7 @@ def _stamp_hybrid_walls(
     stage1_wall_sec: float,
     stage2_wall_sec: float,
     total_wall_sec: float,
-    hybrid_stats: dict[str, int] | None = None,
+    hybrid_stats: dict[str, int | float] | None = None,
 ) -> list[Sample]:
     """Attach per-prompt hybrid phase walls for wandb (step-GRPO extras)."""
     for s in samples:
@@ -417,6 +442,13 @@ async def hybrid_generate(
         "hybrid_num_patch_candidates": 0,
         "hybrid_num_selected_edits": 0,
         "hybrid_num_branch_tasks": 0,
+        "hybrid_num_stage2_samples_before_length_filter": 0,
+        "hybrid_num_stage2_samples_after_length_filter": 0,
+        "hybrid_num_stage2_samples_dropped_over_context": 0,
+        "hybrid_stage2_context_limit_tokens": _stage2_train_context_limit(args),
+        "hybrid_stage2_max_total_tokens": 0,
+        "hybrid_stage2_max_response_tokens": 0,
+        "hybrid_stage2_max_loss_tokens": 0,
         "hybrid_num_dropped_branches": 0,
         "hybrid_num_dropped_timeout": 0,
         "hybrid_num_dropped_resume_tool_echo": 0,
@@ -556,6 +588,39 @@ async def hybrid_generate(
         for s in res:
             s.metadata = s.metadata or {}
             s.metadata.setdefault("sample_kind", "branch")
+            total_tokens = _sample_total_tokens(s)
+            response_tokens = _sample_response_tokens(s)
+            loss_tokens = _sample_loss_tokens(s)
+            hybrid_stats["hybrid_num_stage2_samples_before_length_filter"] += 1
+            hybrid_stats["hybrid_stage2_max_total_tokens"] = max(
+                hybrid_stats["hybrid_stage2_max_total_tokens"],
+                total_tokens,
+            )
+            hybrid_stats["hybrid_stage2_max_response_tokens"] = max(
+                hybrid_stats["hybrid_stage2_max_response_tokens"],
+                response_tokens,
+            )
+            hybrid_stats["hybrid_stage2_max_loss_tokens"] = max(
+                hybrid_stats["hybrid_stage2_max_loss_tokens"],
+                loss_tokens,
+            )
+            limit = int(hybrid_stats["hybrid_stage2_context_limit_tokens"])
+            if limit > 0 and total_tokens > limit:
+                hybrid_stats["hybrid_num_stage2_samples_dropped_over_context"] += 1
+                logger.warning(
+                    "[hybrid] dropped Stage-2 sample over context limit: "
+                    "total_tokens=%d response_tokens=%d loss_tokens=%d limit=%d "
+                    "instance=%s group=%s branch_uid=%s",
+                    total_tokens,
+                    response_tokens,
+                    loss_tokens,
+                    limit,
+                    s.metadata.get("instance_id"),
+                    getattr(s, "group_index", None),
+                    s.metadata.get("branch_uid"),
+                )
+                continue
+            hybrid_stats["hybrid_num_stage2_samples_after_length_filter"] += 1
             # Do not rewrite loss_mask: merge_turns already marks every assistant
             # token in the continuation as trainable (vs first_action), and keeps
             # tool/context tails at 0 with placeholder rollout_log_probs.

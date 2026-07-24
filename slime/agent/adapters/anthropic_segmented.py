@@ -260,6 +260,7 @@ class Session:
     resume: ResumeState | None = None
     adapter_cpu_workers: int = 0
     adapter_timings: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    sft_turn_index: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1307,6 +1308,99 @@ def _serialize_prompt_checkpoints(
     return [checkpoint.to_dict() for checkpoint in checkpoints]
 
 
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _session_log_path(log_dir: str, sid: str) -> str:
+    sid_hash = hashlib.sha256(str(sid).encode("utf-8")).hexdigest()
+    return os.path.join(log_dir, f"{sid_hash[:16]}.sft_turns.jsonl")
+
+
+def _append_jsonl(path: str, record: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(_json_safe(record), ensure_ascii=False, separators=(",", ":")))
+        f.write("\n")
+
+
+def _build_sft_turn_record(
+    *,
+    sid: str,
+    session: Session,
+    turn_index: int,
+    request_sha256: str,
+    request_wire_sha256: str,
+    chain_kind: str,
+    request_kind: str,
+    prompt_messages: list[dict],
+    tools_schema: list[dict] | None,
+    generation_config: dict[str, Any],
+    prompt_ids: list[int],
+    turn: TurnRecord,
+    raw_output_text: str,
+    response_message: dict[str, Any],
+    response_blocks: list[dict[str, Any]],
+    stop_reason: str,
+    include_session_id: bool,
+    include_token_ids: bool,
+    include_logprobs: bool,
+    include_wire_request: bool,
+    wire_request_body: dict[str, Any],
+) -> dict[str, Any]:
+    sid_hash = hashlib.sha256(str(sid).encode("utf-8")).hexdigest()
+    record: dict[str, Any] = {
+        "version": 1,
+        "created_at_unix": time.time(),
+        "session_id_sha256": sid_hash,
+        "turn_index": int(turn_index),
+        "request_sha256": request_sha256,
+        "request_wire_sha256": request_wire_sha256,
+        "chain_kind": chain_kind,
+        "request_kind": request_kind,
+        "prompt": {
+            "messages": copy.deepcopy(prompt_messages),
+            "tools_schema": copy.deepcopy(tools_schema),
+            "tools_sha256": canonical_sha256(tools_schema),
+            "generation_config": copy.deepcopy(generation_config),
+            "prompt_ids_sha256": prompt_ids_sha256(prompt_ids),
+            "prompt_token_count": len(prompt_ids),
+        },
+        "response": {
+            "message": copy.deepcopy(response_message),
+            "blocks": copy.deepcopy(response_blocks),
+            "raw_output_text": raw_output_text,
+            "finish_reason": turn.finish_reason,
+            "stop_reason": stop_reason,
+            "output_token_count": len(turn.output_ids),
+            "ill_formed": bool(turn.ill_formed),
+        },
+    }
+    if session.resume is not None:
+        record["resume"] = {
+            "mode": "token_exact",
+            "checkpoint_id": session.resume.checkpoint.checkpoint_id,
+            "checkpoint_prompt_sha256": session.resume.checkpoint.prompt_sha256,
+            "first_prompt_exact": bool(session.resume.first_prompt_exact),
+            "exact_request_count": int(session.resume.exact_request_count),
+        }
+    else:
+        record["resume"] = {"mode": "fresh"}
+    if include_session_id:
+        record["session_id"] = sid
+    if include_token_ids:
+        record["prompt"]["prompt_ids"] = list(prompt_ids)
+        record["response"]["output_ids"] = list(turn.output_ids)
+    if include_logprobs:
+        record["response"]["output_log_probs"] = list(turn.output_log_probs)
+    if include_wire_request:
+        record["wire_request"] = copy.deepcopy(wire_request_body)
+    return record
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -1345,6 +1439,11 @@ class SegmentedAnthropicAdapter:
         )
         self._cpu_executor_closed = False
         self._tokenizer_fingerprint = tokenizer_fingerprint(self.tokenizer)
+        self.sft_log_dir = (os.environ.get("SLIME_AGENT_SFT_LOG_DIR") or "").strip()
+        self.sft_include_session_id = _env_flag("SLIME_AGENT_SFT_LOG_INCLUDE_SESSION_ID")
+        self.sft_include_token_ids = _env_flag("SLIME_AGENT_SFT_LOG_INCLUDE_TOKEN_IDS")
+        self.sft_include_logprobs = _env_flag("SLIME_AGENT_SFT_LOG_INCLUDE_LOGPROBS")
+        self.sft_include_wire_request = _env_flag("SLIME_AGENT_SFT_LOG_INCLUDE_WIRE_REQUEST")
         self.store: dict[str, Session] = {}
         self.inflight: dict[str, set[asyncio.Task]] = {}
         self.closed: set[str] = set()
@@ -1728,6 +1827,7 @@ class SegmentedAnthropicAdapter:
             self.inflight.setdefault(sid, set()).add(task)
         status = "error"
         resume_response_cache: _ResumeResponseCache | None = None
+        sft_record: dict[str, Any] | None = None
         try:
             lock_started = time.perf_counter()
             async with session.lock:
@@ -1735,6 +1835,11 @@ class SegmentedAnthropicAdapter:
                     time.perf_counter() - lock_started
                 ) * 1000.0
                 checkpoint: PromptCheckpoint | None = None
+                sft_chain_kind = "main"
+                sft_request_kind = "unknown"
+                sft_prompt_messages: list[dict] = []
+                sft_tools_schema: list[dict] | None = None
+                sft_generation_config: dict[str, Any] = {}
                 if session.resume is not None:
                     target, is_sub = session.main, False
                     if session.resume.error:
@@ -1838,6 +1943,30 @@ class SegmentedAnthropicAdapter:
                                 resume_response_cache,
                             )
                         prompt_ids = prepared_resume.prompt_ids
+                        if prepared_resume.handshake:
+                            sft_request_kind = "resume_handshake"
+                            sft_prompt_messages = copy.deepcopy(
+                                session.resume.checkpoint.chat_messages
+                            )
+                            sft_tools_schema = copy.deepcopy(
+                                session.resume.checkpoint.tools_schema
+                            )
+                            sft_generation_config = copy.deepcopy(
+                                session.resume.checkpoint.generation_config
+                            )
+                        else:
+                            sft_request_kind = (
+                                "resume_max_tokens"
+                                if prepared_resume.max_tokens_continuation
+                                else "resume_append"
+                            )
+                            sft_prompt_messages = copy.deepcopy(
+                                prepared_resume.chat_messages
+                                if prepared_resume.chat_messages is not None
+                                else session.main.chat_messages
+                            )
+                            sft_tools_schema = copy.deepcopy(session.main.tools_schema)
+                            sft_generation_config = _generation_config(body, session)
                     except (TypeError, ValueError, RuntimeError) as error:
                         status = "resume_rejected"
                         return self._resume_failure(session, error)
@@ -1883,6 +2012,11 @@ class SegmentedAnthropicAdapter:
                     _apply_prepared_fresh_request(session, target, prepared_fresh, kind)
                     prompt_ids = prepared_fresh.prompt_ids
                     checkpoint = prepared_fresh.checkpoint
+                    sft_chain_kind = "sub" if is_sub else "main"
+                    sft_request_kind = kind
+                    sft_prompt_messages = copy.deepcopy(prepared_fresh.chat_messages)
+                    sft_tools_schema = copy.deepcopy(prepared_fresh.tools_schema)
+                    sft_generation_config = _generation_config(body, session)
 
                 try:
                     sglang_started = time.perf_counter()
@@ -1910,6 +2044,11 @@ class SegmentedAnthropicAdapter:
                     raise
                 _note_cpu_timing(timing, "adapter_parse_ms", parse_result)
                 blocks, stop_reason, manager_message, dispatch_id = parse_result.value
+                raw_output_text = (
+                    self.tokenizer.decode(turn.output_ids, skip_special_tokens=False)
+                    if turn.output_ids
+                    else ""
+                )
                 tool_use_ids = [
                     str(block.get("id") or "")
                     for block in blocks
@@ -1954,6 +2093,31 @@ class SegmentedAnthropicAdapter:
                     session.resume.last_stop_reason = stop_reason
                     session.resume.exact_request_count += 1
                 record_turn(session, target, turn, tool_use_ids=tool_use_ids)
+                if self.sft_log_dir:
+                    sft_record = _build_sft_turn_record(
+                        sid=sid,
+                        session=session,
+                        turn_index=session.sft_turn_index,
+                        request_sha256=request_sha256,
+                        request_wire_sha256=request_wire_sha256,
+                        chain_kind=sft_chain_kind,
+                        request_kind=sft_request_kind,
+                        prompt_messages=sft_prompt_messages,
+                        tools_schema=sft_tools_schema,
+                        generation_config=sft_generation_config,
+                        prompt_ids=prompt_ids,
+                        turn=turn,
+                        raw_output_text=raw_output_text,
+                        response_message=manager_message,
+                        response_blocks=blocks,
+                        stop_reason=stop_reason,
+                        include_session_id=self.sft_include_session_id,
+                        include_token_ids=self.sft_include_token_ids,
+                        include_logprobs=self.sft_include_logprobs,
+                        include_wire_request=self.sft_include_wire_request,
+                        wire_request_body=body,
+                    )
+                    session.sft_turn_index += 1
                 if session.resume is None and dispatch_id and not is_sub:
                     start_sub_chain(session, dispatch_id)
                 in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
@@ -1968,6 +2132,15 @@ class SegmentedAnthropicAdapter:
                         in_tok=in_tok,
                         out_tok=out_tok,
                     )
+
+            if sft_record is not None:
+                await self._run_cpu(
+                    functools.partial(
+                        _append_jsonl,
+                        _session_log_path(self.sft_log_dir, sid),
+                        sft_record,
+                    )
+                )
 
             if resume_response_cache is not None:
                 response = await _render_cached_resume_response(

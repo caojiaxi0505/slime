@@ -515,6 +515,7 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
     out["perf/step_grpo/stage2_active_tokens"] = float(active_tokens["branch"])
     out["perf/step_grpo/stage1_nominal_loss_weight"] = nominal_weights["vanilla"]
     out["perf/step_grpo/stage2_nominal_loss_weight"] = nominal_weights["branch"]
+    out["perf/step_grpo/stage1_loss_weight"] = float(os.environ.get("STEP_GRPO_STAGE1_LOSS_WEIGHT", "1"))
     out["perf/step_grpo/branch_loss_weight"] = float(os.environ.get("STEP_GRPO_BRANCH_LOSS_WEIGHT", "1"))
     out["perf/step_grpo/transcript_status_known"] = float(transcript_known)
     out["perf/step_grpo/transcript_invalid_trials"] = float(transcript_invalid)
@@ -586,6 +587,18 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
         ("hybrid_num_patch_candidates", "n_patch_candidates"),
         ("hybrid_num_selected_edits", "n_selected_edits"),
         ("hybrid_num_branch_tasks", "n_branch_tasks"),
+        (
+            "hybrid_num_stage2_samples_before_length_filter",
+            "n_stage2_samples_before_length_filter",
+        ),
+        (
+            "hybrid_num_stage2_samples_after_length_filter",
+            "n_stage2_samples_after_length_filter",
+        ),
+        (
+            "hybrid_num_stage2_samples_dropped_over_context",
+            "n_stage2_samples_dropped_over_context",
+        ),
         ("hybrid_num_dropped_branches", "n_dropped_branches"),
         ("hybrid_num_dropped_timeout", "n_dropped_timeout"),
         ("hybrid_num_dropped_resume_tool_echo", "n_dropped_resume_tool_echo"),
@@ -601,6 +614,22 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
         known_values = [v for v in values if v is not None]
         if known_values:
             out[f"perf/step_grpo/{metric_leaf}"] = float(sum(known_values))
+    for metadata_key, metric_leaf in (
+        ("hybrid_stage2_context_limit_tokens", "stage2_context_limit_tokens"),
+        ("hybrid_stage2_max_total_tokens", "stage2_max_total_tokens_before_length_filter"),
+        ("hybrid_stage2_max_response_tokens", "stage2_max_response_tokens_before_length_filter"),
+        ("hybrid_stage2_max_loss_tokens", "stage2_max_loss_tokens_before_length_filter"),
+    ):
+        values = [_safe_float(_meta(s).get(metadata_key)) for s in prompt_reps.values()]
+        known_values = [v for v in values if v is not None]
+        if known_values:
+            out[f"perf/step_grpo/{metric_leaf}"] = float(max(known_values))
+    before_filter = out.get("perf/step_grpo/n_stage2_samples_before_length_filter")
+    dropped_over_context = out.get("perf/step_grpo/n_stage2_samples_dropped_over_context")
+    if before_filter is not None and before_filter > 0 and dropped_over_context is not None:
+        out["perf/step_grpo/stage2_over_context_sample_rate"] = (
+            dropped_over_context / before_filter
+        )
     planned_stage1 = out.get("perf/step_grpo/n_stage1_planned_trials")
     aborted_stage1 = out.get("perf/step_grpo/n_stage1_aborted_placeholders")
     if planned_stage1 is not None and planned_stage1 > 0 and aborted_stage1 is not None:
