@@ -18,6 +18,7 @@ _SCRIPT = "/tmp/slime_ws_init.sh"
 _PATCH = "/tmp/slime_ws_patch.diff"
 _SCRUB_MARKER = "slime_git_scrub"
 _SCRUB_EVAL_MARKER = "slime_git_scrub_eval"
+_SWEBENCH_GIT_SETUP_MARKER = "slime_swebench_git_setup"
 _SCRUB_COMMIT_DATE = "2000-01-01T00:00:00+0000"
 _ESP_IDF_EXAMPLES = "/workspace/esp-idf/examples"
 _HUNK_RE = re.compile(r"@@ -(\d+(?:,\d+)?) \+(\d+(?:,\d+)?) @@(.*)")
@@ -107,7 +108,12 @@ def task_fields_from_metadata(md: dict[str, Any]) -> TaskFields:
 
 
 def build_git_scrub_command(workdir: str) -> str:
-    """Agent/rollout scrub: drop remotes/refs and orphan-commit current tree."""
+    """Synthetic-dataset scrub: hide all history behind an orphan commit.
+
+    SWE-bench Classic uses :func:`build_swebench_git_setup_command` instead so
+    the agent sees the real base commit and its ancestors, as in the official
+    SWE-bench harness.
+    """
     wd = shlex.quote(workdir)
     return f"""\
 # ---- {_SCRUB_MARKER} --------------------------------------------
@@ -138,19 +144,114 @@ fi
 """
 
 
+def build_swebench_git_setup_command(workdir: str, base_commit: str) -> str:
+    """Prepare SWE-bench Git state while retaining base history.
+
+    This mirrors the official harness's observable repository state: HEAD is a
+    normal ``SWE-bench`` child of the real base commit, the base's ancestors
+    remain visible, and remotes/future refs are removed.  The setup commit uses
+    the base commit's timestamp so repeated rollouts also get the same HEAD.
+    """
+    wd = shlex.quote(workdir)
+    base = shlex.quote(base_commit)
+    return f"""\
+# ---- {_SWEBENCH_GIT_SETUP_MARKER} --------------------------------
+set -o pipefail
+if [ ! -d {wd}/.git ]; then
+    echo "[workspace_init][swebench] missing Git repository: {wd}" >&2
+    exit 1
+fi
+cd {wd}
+_target_ref={base}
+_target_commit=$(git rev-parse --verify "${{_target_ref}}^{{commit}}")
+_current_head=$(git rev-parse --verify HEAD)
+if [ "$_current_head" != "$_target_commit" ]; then
+    echo "[workspace_init][swebench] HEAD is not base_commit" >&2
+    exit 1
+fi
+_target_timestamp=$(git show -s --format=%ct "$_target_commit")
+_setup_date=$(git show -s --format=%cI "$_target_commit")
+_current_branch=$(git symbolic-ref -q --short HEAD 2>/dev/null || true)
+
+# The official harness starts from a single-branch clone and removes origin.
+# Runtime images may contain additional local/remote refs, so remove those
+# explicitly while retaining the checked-out branch and non-future tags.
+for _remote in $(git remote 2>/dev/null); do
+    git remote remove "$_remote"
+done
+git for-each-ref --format='%(refname)' refs/remotes/ 2>/dev/null \\
+    | while read -r _ref; do
+        git update-ref -d "$_ref"
+    done
+git for-each-ref --format='%(refname)' refs/heads/ 2>/dev/null \\
+    | while read -r _ref; do
+        if [ -z "$_current_branch" ] || [ "$_ref" != "refs/heads/$_current_branch" ]; then
+            git update-ref -d "$_ref"
+        fi
+    done
+git for-each-ref --format='%(refname)' 2>/dev/null \\
+    | while read -r _ref; do
+        case "$_ref" in
+            refs/heads/*|refs/remotes/*|refs/tags/*) ;;
+            *) git update-ref -d "$_ref" ;;
+        esac
+    done
+git for-each-ref --format='%(refname)' refs/tags/ 2>/dev/null \\
+    | while read -r _ref; do
+        _tag_commit=$(git rev-parse --verify "${{_ref}}^{{commit}}" 2>/dev/null || true)
+        if [ -n "$_tag_commit" ]; then
+            _tag_timestamp=$(git show -s --format=%ct "$_tag_commit")
+            if [ "$_tag_timestamp" -gt "$_target_timestamp" ]; then
+                git update-ref -d "$_ref"
+            fi
+        fi
+    done
+git reflog expire --expire=now --all
+git gc --prune=now --aggressive >/dev/null 2>&1
+
+_future_commit=$(
+    git rev-list --all --timestamp \\
+        | awk -v cutoff="$_target_timestamp" '$1 > cutoff {{ print $2; exit }}'
+)
+if [ -n "$_future_commit" ]; then
+    echo "[workspace_init][swebench] future commit remains reachable: $_future_commit" >&2
+    exit 1
+fi
+
+git config user.email 'setup@swebench.config'
+git config user.name 'SWE-bench'
+git config commit.gpgSign false
+GIT_AUTHOR_NAME='SWE-bench' \\
+GIT_AUTHOR_EMAIL='setup@swebench.config' \\
+GIT_COMMITTER_NAME='SWE-bench' \\
+GIT_COMMITTER_EMAIL='setup@swebench.config' \\
+GIT_AUTHOR_DATE="$_setup_date" \\
+GIT_COMMITTER_DATE="$_setup_date" \\
+git -c commit.gpgSign=false commit --allow-empty --no-verify --no-gpg-sign \\
+    -q -am 'SWE-bench'
+
+if [ "$(git rev-parse --verify HEAD^)" != "$_target_commit" ]; then
+    echo "[workspace_init][swebench] setup commit parent is not base_commit" >&2
+    exit 1
+fi
+# ---- {_SWEBENCH_GIT_SETUP_MARKER} end ----------------------------
+"""
+
+
 def build_eval_git_scrub_command(workdir: str) -> str:
-    """Eval scrub: point refs at HEAD / clear future-shaped history (no orphan rewrite)."""
+    """Eval setup: keep the image's original Git graph and version tags intact.
+
+    The evaluator runs in a separate sandbox that is never exposed to the
+    coding agent. Rewriting its refs therefore provides no isolation benefit,
+    while moving release tags changes versions derived by ``setuptools_scm``
+    and can make the official tests exercise a different package version.
+    """
     wd = shlex.quote(workdir)
     return f"""\
 # ---- {_SCRUB_EVAL_MARKER} ----------------------------------------
 cd {wd} || exit 0
 git config user.email 'slime@local' 2>/dev/null || true
 git config user.name 'slime' 2>/dev/null || true
-git for-each-ref --format='%(refname)' 2>/dev/null | while read ref; do
-  git update-ref "$ref" HEAD 2>/dev/null || true
-done
-git stash clear 2>/dev/null || true
-git reflog expire --expire=now --all 2>/dev/null || true
 # ---- {_SCRUB_EVAL_MARKER} end ------------------------------------
 """
 
@@ -172,6 +273,11 @@ async def apply_swebench_reset(sb, workdir: str, base_commit: str) -> bool:
         return True
     script = f"cd {shlex.quote(workdir)} && git reset --hard {shlex.quote(base_commit)}"
     return await _exec_script(sb, workdir, script, fail_fast=True) == 0
+
+
+async def apply_swebench_git_setup(sb, workdir: str, base_commit: str) -> bool:
+    body = build_swebench_git_setup_command(workdir, base_commit)
+    return await _exec_script(sb, workdir, body, fail_fast=True) == 0
 
 
 async def apply_git_scrub(sb, workdir: str, *, rollout_side: bool = True) -> None:
@@ -394,6 +500,13 @@ async def initialize_task_workspace(sb, fields: TaskFields, *, rollout_side: boo
         await scaleswe_root_filesystem_prep(sb)
     # rebench / generic: ensure user only
 
-    if _needs_scrub(mode):
+    if mode == WorkspaceMode.SWEBENCH_CLASSIC and rollout_side:
+        if not await apply_swebench_git_setup(sb, workdir, fields.base_commit):
+            logger.warning(
+                "[workspace_init] official-style Git setup failed for %s",
+                fields.instance_id,
+            )
+            return False
+    elif _needs_scrub(mode):
         await apply_git_scrub(sb, workdir, rollout_side=rollout_side)
     return True

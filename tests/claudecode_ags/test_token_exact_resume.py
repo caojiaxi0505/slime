@@ -108,6 +108,52 @@ def test_prompt_checkpoint_roundtrip_and_hash_is_stable():
     assert prompt_ids_sha256([1, 2, 3]) != prompt_ids_sha256([3, 2, 1])
 
 
+def test_segmented_adapter_sampling_overrides_win_over_request_body():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 700)]]) as sglang:
+            tokenizer = FakeTokenizer(outputs={(700,): "done"})
+            adapter = SegmentedAnthropicAdapter(
+                tokenizer=tokenizer,
+                sglang_url=sglang.url,
+            )
+            adapter.open_session(
+                "eval-session",
+                sampling_defaults={"temperature": 0.8},
+                sampling_overrides={
+                    "temperature": 0.6,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                },
+            )
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                response = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer eval-session"},
+                    json={
+                        "model": "m",
+                        "max_tokens": 16,
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": -1,
+                        "messages": [{"role": "user", "content": "fix the bug"}],
+                    },
+                )
+                assert response.status == 200
+                await response.json()
+            finally:
+                await client.close()
+            await adapter.finish_session("eval-session")
+
+        params = sglang.requests[0]["sampling_params"]
+        assert params["temperature"] == 0.6
+        assert params["top_p"] == 0.95
+        assert params["top_k"] == 20
+
+    asyncio.run(run_case())
+
+
 def test_sft_turn_logger_writes_real_request_response_context(tmp_path, monkeypatch):
     async def run_case():
         monkeypatch.setenv("SLIME_AGENT_SFT_LOG_DIR", str(tmp_path))

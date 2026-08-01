@@ -33,6 +33,9 @@ async def evaluate(
         user="agent",
         check=False,
         timeout=timeout_sec,
+        # Do not re-submit a long-running test command after a severed stream.
+        # AGS routes non-idempotent execs through SWE-ReX runtime.execute.
+        idempotent=False,
     )
     return EvalResult(
         resolved=ec == 0,

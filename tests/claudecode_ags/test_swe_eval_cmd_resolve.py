@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from examples.claudecode_ags.swe_eval.cmd_resolve import EvalMode, detect_eval_mode, resolve_eval_plan
 
 
@@ -60,18 +62,32 @@ def test_rebench_plan_uses_test_cmd():
     assert plan.log_parser == "parse_log_pytest"
 
 
-def test_swebench_plan_pytest_nodeids():
+def test_swebench_plan_uses_official_eval_script(monkeypatch):
+    test_spec = SimpleNamespace(
+        eval_script="official repo-specific test command\n",
+        instance_id="psf__requests-1",
+        repo="psf/requests",
+    )
+    monkeypatch.setattr(
+        "examples.claudecode_ags.swe_eval.official.make_official_test_spec",
+        lambda metadata: test_spec,
+    )
     plan = resolve_eval_plan(
         {
+            "instance_id": "psf__requests-1",
             "repo": "psf/requests",
+            "version": "2.0",
+            "base_commit": "abc",
             "FAIL_TO_PASS": ["tests/test_x.py::test_a"],
             "PASS_TO_PASS": ["tests/test_x.py::test_b"],
             "test_patch": "diff --git a/x b/x\n",
         }
     )
     assert plan.mode == EvalMode.SWEBENCH
-    assert "tests/test_x.py::test_a" in plan.eval_cmd
-    assert plan.test_patch.startswith("diff")
+    assert plan.eval_cmd == test_spec.eval_script
+    assert plan.test_patch == ""
+    assert plan.official_test_spec is test_spec
+    assert plan.details["runner"] == "official_swebench"
 
 
 def test_priority_scaleswe_over_rebench():

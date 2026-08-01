@@ -24,7 +24,7 @@ spec:
             owner: jiaxicao
         spec:
           nodeSelector:
-            group: shennong-5
+            group: ${K8S_NODE_GROUP}
             node.kubernetes.io/instance-type: ml.p5e.48xlarge
             topology.kubernetes.io/zone: ap-southeast-3a
           tolerations:

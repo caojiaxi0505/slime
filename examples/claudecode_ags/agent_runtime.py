@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 from pathlib import Path
@@ -26,6 +27,99 @@ _DEFAULT_COS_CC_DIR = "/opt/cc-cos"
 _INITIAL_PROMPT_PATH = "/tmp/slime_cc_initial_prompt.jsonl"
 _RESUME_HANDSHAKE_PATH = "/tmp/slime_cc_resume_handshake.jsonl"
 _RESUME_HANDSHAKE = "__SLIME_TOKEN_EXACT_RESUME_HANDSHAKE__"
+
+
+def _testbed_conda_activation_script() -> str:
+    """Activate the task's prebuilt SWE-bench environment for Agent tools.
+
+    SWE-ReX prepends its own Python environment to ``PATH``. Without an
+    explicit activation, Bash calls made by Claude Code resolve ``python`` to
+    ``/nix/swerex/venv/bin/python`` instead of the task image's ``testbed``
+    environment.
+    """
+    return (
+        "# --- Activate task test environment ---\n"
+        "set +u\n"
+        "_SLIME_TESTBED_ACTIVE=0\n"
+        "if [ -f /opt/miniconda3/bin/activate ] "
+        "&& [ -d /opt/miniconda3/envs/testbed ]; then\n"
+        "    if source /opt/miniconda3/bin/activate 2>/dev/null "
+        "&& conda activate testbed 2>/dev/null; then\n"
+        "        _SLIME_TESTBED_ACTIVE=1\n"
+        "    fi\n"
+        "fi\n"
+        'if [ "$_SLIME_TESTBED_ACTIVE" != "1" ] '
+        "&& [ -f /opt/conda/bin/activate ] "
+        "&& [ -d /opt/conda/envs/testbed ]; then\n"
+        "    if source /opt/conda/bin/activate 2>/dev/null "
+        "&& conda activate testbed 2>/dev/null; then\n"
+        "        _SLIME_TESTBED_ACTIVE=1\n"
+        "    fi\n"
+        "fi\n"
+        'if [ "$_SLIME_TESTBED_ACTIVE" != "1" ] '
+        "&& [ -d /opt/miniconda3/bin ]; then\n"
+        "    export PATH=/opt/miniconda3/bin:$PATH\n"
+        'elif [ "$_SLIME_TESTBED_ACTIVE" != "1" ] '
+        "&& [ -d /opt/conda/bin ]; then\n"
+        "    export PATH=/opt/conda/bin:$PATH\n"
+        "fi\n"
+        'if [ "$_SLIME_TESTBED_ACTIVE" != "1" ] '
+        '&& [ "$(command -v python 2>/dev/null || true)" = '
+        "/nix/swerex/venv/bin/python ] "
+        "&& [ -x /usr/local/bin/python ]; then\n"
+        "    export PATH=/usr/local/bin:$PATH\n"
+        "fi\n"
+        "unset _SLIME_TESTBED_ACTIVE\n"
+        "# --- End task test environment activation ---\n"
+    )
+
+
+def _initial_input_mode() -> str:
+    mode = (os.environ.get("SLIME_CC_INITIAL_INPUT_MODE") or "stream-json").strip().lower()
+    if mode not in {"stream-json", "positional"}:
+        raise ValueError(
+            "SLIME_CC_INITIAL_INPUT_MODE must be 'stream-json' or 'positional', "
+            f"got {mode!r}"
+        )
+    return mode
+
+
+def _extra_claude_args() -> str:
+    raw = (os.environ.get("SLIME_CC_EXTRA_ARGS_JSON") or "").strip()
+    if not raw:
+        return ""
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("SLIME_CC_EXTRA_ARGS_JSON must be a JSON string array") from exc
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise ValueError("SLIME_CC_EXTRA_ARGS_JSON must be a JSON string array")
+    return " ".join(shlex.quote(value) for value in values)
+
+
+async def _run_claude_command(
+    sb,
+    *,
+    workdir: str,
+    env: dict[str, str],
+    time_budget_sec: int,
+    cmd: str,
+) -> dict:
+    cmd = _testbed_conda_activation_script() + cmd
+    exit_code = await run_agent(
+        sb,
+        workdir=workdir,
+        start_cmd=cmd,
+        env=env,
+        time_budget_sec=time_budget_sec,
+    )
+    trajectory_path = f"{workdir}/.harness/trajectory.jsonl"
+    trajectory = await sb.read_file(trajectory_path, user="agent")
+    return {
+        "exit_code": exit_code,
+        "trajectory_path": trajectory_path,
+        "trajectory_jsonl": str(trajectory or ""),
+    }
 
 
 async def prepare_workspace(
@@ -145,7 +239,26 @@ async def run_claude(
     time_budget_sec: int,
     claude_session_id: str | None = None,
 ) -> dict:
-    """Start a new task through the same stream-json path used by Stage-2."""
+    """Start a new task using the configured, auditable Claude input mode."""
+    if _initial_input_mode() == "positional":
+        session_flag = (
+            f"--session-id {shlex.quote(claude_session_id)} "
+            if claude_session_id
+            else ""
+        )
+        extra_args = _extra_claude_args()
+        cmd = (
+            f"{CLAUDE_BIN} -p {shlex.quote(prompt)} {session_flag}{CLAUDE_FLAGS}"
+            f"{f' {extra_args}' if extra_args else ''}"
+        )
+        return await _run_claude_command(
+            sb,
+            workdir=workdir,
+            env=env,
+            time_budget_sec=time_budget_sec,
+            cmd=cmd,
+        )
+
     await sb.write_file(
         _INITIAL_PROMPT_PATH,
         initial_prompt_jsonl(prompt),
@@ -176,24 +289,18 @@ async def run_claude_with_prefix(
     taking the next turn for the Stage-2 bridge.
     """
     session_flag = f"--session-id {shlex.quote(claude_session_id)} " if claude_session_id else ""
+    extra_args = _extra_claude_args()
     cmd = (
         f"{CLAUDE_BIN} -p {session_flag}--input-format stream-json {CLAUDE_FLAGS} "
-        f"< {shlex.quote(prefix_path)}"
+        f"{f'{extra_args} ' if extra_args else ''}< {shlex.quote(prefix_path)}"
     )
-    exit_code = await run_agent(
+    return await _run_claude_command(
         sb,
         workdir=workdir,
-        start_cmd=cmd,
         env=env,
         time_budget_sec=time_budget_sec,
+        cmd=cmd,
     )
-    trajectory_path = f"{workdir}/.harness/trajectory.jsonl"
-    trajectory = await sb.read_file(trajectory_path, user="agent")
-    return {
-        "exit_code": exit_code,
-        "trajectory_path": trajectory_path,
-        "trajectory_jsonl": str(trajectory or ""),
-    }
 
 
 async def run_claude_native_resume(
@@ -222,27 +329,22 @@ async def run_claude_native_resume(
         f"{CLAUDE_BIN} -p --resume {shlex.quote(session_path)} --fork-session "
         f"--input-format stream-json {CLAUDE_FLAGS} < {shlex.quote(_RESUME_HANDSHAKE_PATH)}"
     )
-    exit_code = await run_agent(
+    result = await _run_claude_command(
         sb,
         workdir=workdir,
-        start_cmd=cmd,
         env=env,
         time_budget_sec=time_budget_sec,
+        cmd=cmd,
     )
-    trajectory_path = f"{workdir}/.harness/trajectory.jsonl"
-    trajectory = await sb.read_file(trajectory_path, user="agent")
-    return {
-        "exit_code": exit_code,
-        "trajectory_path": trajectory_path,
-        "trajectory_jsonl": str(trajectory or ""),
-        "native_resume_path": session_path,
-    }
+    result["native_resume_path"] = session_path
+    return result
 
 
 async def git_diff(sb, *, workdir: str) -> str:
     cmd = (
         f"cd {workdir} && git add -N . && "
-        "git diff -- . ':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/**'"
+        "git diff HEAD --binary -- . "
+        "':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/**'"
     )
     _, out, _ = await sb.exec(cmd, user="agent", timeout=120)
     return out

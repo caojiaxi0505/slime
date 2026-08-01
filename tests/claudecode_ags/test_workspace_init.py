@@ -91,7 +91,9 @@ def test_swebench_reset_and_scrub():
     bodies = "\n".join(written)
     assert "git reset --hard" in bodies
     assert "abc123" in bodies
-    assert "slime_git_scrub" in bodies
+    assert "slime_swebench_git_setup" in bodies
+    assert "SWE-bench" in bodies
+    assert "__slime_buggy" not in bodies
     assert sum(1 for c in sb.cmds if "bash /tmp/slime_ws_init.sh" in c) == 2
 
 

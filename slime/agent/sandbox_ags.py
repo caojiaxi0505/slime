@@ -60,6 +60,11 @@ _REQUIRED_KEYS = (
     "SLIME_AGENT_AGS_HTTP_ENDPOINT",
 )
 
+
+class _AGSRequestBodyParseError(RuntimeError):
+    """AGS rejected the request before executing it because its body was not parsed."""
+
+
 # Optional: when unset/empty, SWE-ReX creates a new SandboxTool for the image.
 _OPTIONAL_TOOL_ID = "SLIME_AGENT_AGS_TOOL_ID"
 
@@ -134,6 +139,8 @@ def _retry_delays() -> tuple[float, ...]:
 
 
 def _is_transient_request_error(exc: BaseException) -> bool:
+    if isinstance(exc, _AGSRequestBodyParseError):
+        return True
     if isinstance(
         exc,
         (
@@ -219,7 +226,10 @@ class AGSSandbox:
             "image_registry_type": _optional("SLIME_AGENT_AGS_IMAGE_REGISTRY_TYPE", "enterprise"),
             "timeout": _optional("SLIME_AGENT_AGS_TIMEOUT", "30m"),
             "startup_timeout": float(_optional("SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC", "600")),
-            "runtime_timeout": float(_optional("SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC", "600")),
+            # SWE-ReX request timeout. Keep it wider than the 30m agent plus
+            # 10m evaluator command while the outer pipeline guard remains the
+            # authoritative 45m wall-clock bound.
+            "runtime_timeout": float(_optional("SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC", "2700")),
             "cpu": _optional("SLIME_AGENT_AGS_CPU", "2"),
             "memory": _optional("SLIME_AGENT_AGS_MEMORY", "4Gi"),
             "port": int(_optional("SLIME_AGENT_AGS_PORT", "8000")),
@@ -330,6 +340,13 @@ class AGSSandbox:
                     json=command.model_dump(),
                     headers=headers,
                 ) as response:
+                    # AGS occasionally rejects a valid JSON request at its
+                    # HTTP boundary before command execution. Retry only this
+                    # exact 400; other client errors remain non-transient.
+                    if getattr(response, "status", None) == 400:
+                        response_text = await response.text()
+                        if "there was an error parsing the body" in response_text.lower():
+                            raise _AGSRequestBodyParseError(response_text[:400])
                     await runtime._handle_response_errors(response)
                     return self._rex_command_response_cls(**await response.json())
 

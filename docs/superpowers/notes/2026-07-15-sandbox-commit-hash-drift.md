@@ -2,6 +2,11 @@
 
 日期：2026-07-15
 
+> 2026-07-30 更新：SWE-bench Classic rollout 已不再创建无父 `slime initial bug state`
+> commit，而是保留真实 base 历史并创建普通 `SWE-bench` 子提交。本文仍是当时问题和
+> SWE-Smith/Scale-SWE orphan 路径的有效记录。后续修复见
+> `2026-07-30-swebench-git-workspace-official-alignment.md`。
+
 适用分支：`feature/cc-ags-swe`
 
 状态：已修复并通过针对性测试；尚未提交 commit，未重启任何训练任务

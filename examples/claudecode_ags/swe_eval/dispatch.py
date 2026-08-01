@@ -97,11 +97,19 @@ async def evaluate(
 
     script = "/tmp/slime_eval_run.sh"
     await sb.write_file(script, "set +e\n" + plan.eval_cmd, user="agent")
+    # Official scripts emit their boundary markers through ``set -x`` on
+    # stderr while test runners normally write stdout. Merge them at the shell
+    # so the official parser sees the original chronological stream.
+    stderr_redirect = " 2>&1" if plan.mode == EvalMode.SWEBENCH else ""
     ec, stdout, stderr = await sb.exec(
-        f"chmod 755 {script} && bash {script}",
+        f"chmod 755 {script} && bash {script}{stderr_redirect}",
         user="agent",
         check=False,
         timeout=timeout_sec,
+        # A test suite is a long, non-idempotent command. On AGS this bypasses
+        # the custom raw-aiohttp retry path and uses SWE-ReX runtime.execute,
+        # whose request timeout is configured independently (2700s in eval).
+        idempotent=False,
     )
 
     if plan.mode == EvalMode.SCALESWE:
@@ -126,6 +134,7 @@ async def evaluate(
             pass_to_pass=plan.pass_to_pass,
             stdout=stdout,
             stderr=stderr,
+            test_spec=plan.official_test_spec,
         )
 
     details = {

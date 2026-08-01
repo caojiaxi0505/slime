@@ -32,6 +32,7 @@ class EvalPlan:
     pass_to_pass: list[str] = field(default_factory=list)
     repo: str = ""
     log_parser: str = ""
+    official_test_spec: Any | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -146,16 +147,24 @@ def resolve_eval_plan(md: dict[str, Any]) -> EvalPlan:
         )
 
     if mode == EvalMode.SWEBENCH:
-        # Prefer pytest on FAIL_TO_PASS ids; swebench repo parsers still grade logs.
+        # The official harness owns the repo-specific command, environment
+        # activation, test patch, output markers, and parser TestSpec.
+        from examples.claudecode_ags.swe_eval.official import make_official_test_spec
+
+        test_spec = make_official_test_spec(md)
         return EvalPlan(
             mode=mode,
-            eval_cmd=_pytest_cmd(workdir, f2p + p2p),
+            eval_cmd=test_spec.eval_script,
             workdir=workdir,
-            test_patch=test_patch,
             fail_to_pass=f2p,
             pass_to_pass=p2p,
             repo=repo,
-            details={"version": str(_md_get(md, "version") or "")},
+            official_test_spec=test_spec,
+            details={
+                "version": str(_md_get(md, "version") or ""),
+                "runner": "official_swebench",
+                "test_patch_owner": "official_eval_script",
+            },
         )
 
     if mode == EvalMode.SIMPLE_CMD:

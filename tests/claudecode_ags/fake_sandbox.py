@@ -13,6 +13,7 @@ class FakeSandbox:
         self.files: dict[str, str] = {}
         self.cmds: list[str] = []
         self.exec_envs: list[dict[str, str] | None] = []
+        self.exec_idempotent: list[bool] = []
         self.sandbox_id = "fake"
 
     async def __aenter__(self) -> FakeSandbox:
@@ -31,9 +32,10 @@ class FakeSandbox:
         check: bool = False,
         idempotent: bool = True,
     ) -> tuple[int, str, str]:
-        del user, timeout, check, idempotent
+        del user, timeout, check
         self.cmds.append(cmd)
         self.exec_envs.append(env)
+        self.exec_idempotent.append(idempotent)
 
         m = _SETSID_RE.search(cmd)
         if m:

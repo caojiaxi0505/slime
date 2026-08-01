@@ -32,6 +32,7 @@ def test_dispatch_simple_cmd():
     result = asyncio.run(run())
     assert result.resolved is True
     assert any("true" in c for c in sb.cmds)
+    assert sb.exec_idempotent[-1] is False
 
 
 def test_dispatch_scaleswe_writes_f2p_script_and_runs():
@@ -67,6 +68,8 @@ def test_dispatch_scaleswe_writes_f2p_script_and_runs():
     assert result.details.get("mode") == "scaleswe"
     assert result.resolved is True
     assert any("slime_eval_run.sh" in c for c in sb.cmds)
+    eval_call = next(i for i, cmd in enumerate(sb.cmds) if "slime_eval_run.sh" in cmd)
+    assert sb.exec_idempotent[eval_call] is False
 
 
 def test_dispatch_model_patch_failure():
@@ -74,7 +77,7 @@ def test_dispatch_model_patch_failure():
 
     async def fail_apply(cmd: str, **kwargs):
         sb.cmds.append(cmd)
-        if "git apply" in cmd:
+        if "git apply" in cmd or "patch -p1" in cmd:
             return 1, "", "reject"
         return 0, "", ""
 

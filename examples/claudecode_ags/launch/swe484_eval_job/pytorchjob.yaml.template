@@ -20,8 +20,8 @@ spec:
             workload: ${WORKLOAD}
             owner: jiaxicao
         spec:
-          nodeSelector:
-            group: shennong-5
+${K8S_SCHEDULING_SPEC}          nodeSelector:
+            group: ${K8S_NODE_GROUP}
             node.kubernetes.io/instance-type: ml.p5e.48xlarge
             topology.kubernetes.io/zone: ap-southeast-3a
           tolerations:
@@ -29,7 +29,7 @@ spec:
               operator: Equal
               value: "true"
               effect: NoSchedule
-          containers:
+${K8S_TARGET_NODE_AFFINITY}          containers:
             - name: pytorch
               image: ${IMAGE_URI}
               imagePullPolicy: Always
@@ -47,9 +47,35 @@ spec:
                   sed -i 's|cd /cfs_turbo|cd /|' ~/.bashrc || true
                   ray stop --force 2>/dev/null || true
                   cd "${SLIME_DIR}"
+                  echo "=== install pinned official SWE-bench ==="
+                  python3 -m pip install \
+                    --disable-pip-version-check \
+                    --no-deps \
+                    "swebench==${SLIME_SWEBENCH_VERSION}"
+                  python3 -m pip show swebench | tee "${LOG_DIR}/swebench_package.txt"
+                  echo "=== SWE484 startup audit ==="
+                  python3 -m examples.claudecode_ags.swe_eval.audit preflight \
+                    --dataset "${EVAL_DATA}" \
+                    --report "${LOG_DIR}/startup_check.json" \
+                    --required-version "${SLIME_SWEBENCH_VERSION}" \
+                    --expected-tasks "${SWE_EVAL_EXPECTED_TASKS}"
                   export RUN=1
                   export PHASE=eval
-                  bash examples/claudecode_ags/launch/run_grpo_1node_debug.sh
+                  eval_rc=0
+                  bash examples/claudecode_ags/launch/run_grpo_1node_debug.sh || eval_rc=$?
+                  echo "=== SWE484 artifact audit ==="
+                  artifact_rc=0
+                  python3 -m examples.claudecode_ags.swe_eval.audit postflight \
+                    --dataset "${EVAL_DATA}" \
+                    --artifact-dir "${SLIME_CC_EVAL_ARTIFACT_DIR}" \
+                    --report "${LOG_DIR}/artifact_check.json" \
+                    --required-version "${SLIME_SWEBENCH_VERSION}" \
+                    --expected-tasks "${SWE_EVAL_EXPECTED_TASKS}" \
+                    --samples-per-task "${N_SAMPLES_PER_EVAL_PROMPT}" || artifact_rc=$?
+                  if [[ "${eval_rc}" != "0" || "${artifact_rc}" != "0" ]]; then
+                    echo "ERROR: eval_rc=${eval_rc}, artifact_rc=${artifact_rc}" >&2
+                    exit 1
+                  fi
                   echo "=== SWE484 eval finished; sleeping for log inspection ==="
                   sleep 1h
               env:
@@ -61,6 +87,8 @@ spec:
                   value: ${REF_MODEL_PATH}
                 - name: LOAD_PATH
                   value: ${LOAD_PATH}
+                - name: LOAD_CKPT_STEP
+                  value: "${LOAD_CKPT_STEP}"
                 - name: SAVE_PATH
                   value: ${SAVE_PATH}
                 - name: PROMPT_DATA
@@ -71,6 +99,20 @@ spec:
                   value: ${EXP_TAG}
                 - name: LOG_DIR
                   value: ${LOG_DIR}
+                - name: SLIME_AGENT_SFT_LOG_DIR
+                  value: ${SLIME_AGENT_SFT_LOG_DIR}
+                - name: SLIME_AGENT_SFT_LOG_INCLUDE_SESSION_ID
+                  value: "1"
+                - name: SLIME_AGENT_SFT_LOG_INCLUDE_TOKEN_IDS
+                  value: "1"
+                - name: SLIME_AGENT_SFT_LOG_INCLUDE_WIRE_REQUEST
+                  value: "1"
+                - name: SLIME_CC_EVAL_ARTIFACT_DIR
+                  value: ${SLIME_CC_EVAL_ARTIFACT_DIR}
+                - name: SLIME_SWEBENCH_VERSION
+                  value: "${SLIME_SWEBENCH_VERSION}"
+                - name: SWE_EVAL_EXPECTED_TASKS
+                  value: "${SWE_EVAL_EXPECTED_TASKS}"
                 - name: PHASE
                   value: eval
                 - name: WANDB_PROJECT
@@ -113,6 +155,14 @@ spec:
                   value: "0"
                 - name: N_SAMPLES_PER_EVAL_PROMPT
                   value: "${N_SAMPLES_PER_EVAL_PROMPT}"
+                - name: MAX_CONTEXT_LEN
+                  value: "${MAX_CONTEXT_LEN}"
+                - name: MAX_GEN_LEN
+                  value: "${MAX_GEN_LEN}"
+                - name: EVAL_MAX_PROMPT_LEN
+                  value: "${EVAL_MAX_PROMPT_LEN}"
+                - name: ROLLOUT_MAX_CONTEXT_LEN
+                  value: "${ROLLOUT_MAX_CONTEXT_LEN}"
                 - name: EVAL_INTERVAL
                   value: "1"
                 - name: SAVE_INTERVAL
@@ -162,17 +212,53 @@ spec:
                 - name: SLIME_AGENT_COS_CC_PACKAGE
                   value: cc-prefix-2.1.104-linux-x64.tar.gz
                 - name: SLIME_CC_TIME_BUDGET_SEC
-                  value: "5400"
+                  value: "${SLIME_CC_TIME_BUDGET_SEC}"
                 - name: SLIME_CC_EVAL_TIMEOUT_SEC
-                  value: "600"
+                  value: "${SLIME_CC_EVAL_TIMEOUT_SEC}"
+                - name: SLIME_CC_GENERATE_GUARD_SEC
+                  value: "${SLIME_CC_GENERATE_GUARD_SEC}"
+                - name: SLIME_CC_EVAL_GUARD_SEC
+                  value: "${SLIME_CC_EVAL_GUARD_SEC}"
+                - name: SLIME_CC_EVAL_INFRA_RETRIES
+                  value: "${SLIME_CC_EVAL_INFRA_RETRIES}"
                 - name: SLIME_CC_AGENT_CONCURRENCY
-                  value: "64"
+                  value: "${SLIME_CC_AGENT_CONCURRENCY}"
+                - name: SLIME_CC_EVAL_CONCURRENCY
+                  value: "${SLIME_CC_EVAL_CONCURRENCY}"
+                - name: SLIME_CC_AGENT_PROMPT
+                  value: '${SLIME_CC_AGENT_PROMPT}'
+                - name: SLIME_CC_INITIAL_INPUT_MODE
+                  value: "${SLIME_CC_INITIAL_INPUT_MODE}"
+                - name: SLIME_CC_EXTRA_ARGS_JSON
+                  value: '${SLIME_CC_EXTRA_ARGS_JSON}'
+                - name: ANTHROPIC_MODEL
+                  value: slime-actor
+                - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+                  value: slime-actor
+                - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+                  value: slime-actor
+                - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+                  value: slime-actor
+                - name: CLAUDE_CODE_SUBAGENT_MODEL
+                  value: slime-actor
+                - name: CLAUDE_CODE_AUTO_COMPACT_WINDOW
+                  value: "${CLAUDE_CODE_AUTO_COMPACT_WINDOW}"
+                - name: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+                  value: "${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE}"
+                - name: CLAUDE_CODE_MAX_OUTPUT_TOKENS
+                  value: "${CLAUDE_CODE_MAX_OUTPUT_TOKENS}"
+                - name: CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING
+                  value: "${CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING}"
+                - name: CLAUDE_CODE_SKIP_PROMPT_HISTORY
+                  value: "${CLAUDE_CODE_SKIP_PROMPT_HISTORY}"
+                - name: CLAUDE_CODE_DISABLE_TERMINAL_TITLE
+                  value: "${CLAUDE_CODE_DISABLE_TERMINAL_TITLE}"
                 - name: SLIME_AGENT_AGS_TIMEOUT
-                  value: "120m"
+                  value: "${SLIME_AGENT_AGS_TIMEOUT}"
                 - name: SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC
-                  value: "7200"
+                  value: "${SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC}"
                 - name: SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC
-                  value: "600"
+                  value: "${SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC}"
                 - name: PATH
                   value: /root/miniconda3/envs/agent-lightning/bin:/root/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
                 - name: NCCL_SOCKET_IFNAME

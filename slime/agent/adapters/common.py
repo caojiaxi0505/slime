@@ -32,13 +32,14 @@ __all__ = ["TurnRecord"]
 
 @dataclasses.dataclass
 class Session:
-    """Per-sid adapter state: sampling defaults and context budget.
+    """Per-sid adapter state: sampling policy and context budget.
 
     Trajectory state lives in the shared TrajectoryManager (BaseAdapter.manager),
     not here.
     """
 
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
+    sampling_overrides: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
 
 
@@ -218,6 +219,7 @@ class BaseAdapter:
         sid: str,
         *,
         sampling_defaults: dict | None = None,
+        sampling_overrides: dict | None = None,
         max_context_tokens: int = 0,
     ) -> None:
         """Register a fresh per-sid Session; sids must be unique."""
@@ -225,6 +227,7 @@ class BaseAdapter:
             raise ValueError(f"session_id {sid!r} already exists; sids must be unique per agent run")
         self.store[sid] = Session(
             sampling_defaults=dict(sampling_defaults or {}),
+            sampling_overrides=dict(sampling_overrides or {}),
             max_context_tokens=int(max_context_tokens or 0),
         )
 
@@ -436,6 +439,11 @@ def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...
     for src_k, dst_k in (("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k")):
         if src_k in body:
             sp[dst_k] = body[src_k]
+
+    # Framework-owned rollout/eval settings are authoritative when explicitly
+    # supplied. In particular, Claude Code currently sends temperature=1 in
+    # every request, which must not override an eval-temperature such as 0.6.
+    sp.update(getattr(session, "sampling_overrides", None) or {})
 
     for key in stop_keys:
         if body.get(key):

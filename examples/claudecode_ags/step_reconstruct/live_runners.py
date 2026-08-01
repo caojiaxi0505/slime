@@ -214,13 +214,14 @@ async def live_vanilla_runner(
 
     try:
         claude_env = gen._build_claude_env(adapter_url=state.adapter_url, session_id=session_id)
-        # Acquire slot before the per-agent guard so queue wait does not burn
-        # the Claude/eval budget (Stage-2 has large fan-out behind concurrency=64).
+        # Acquire the agent slot before starting the shared Agent→eval deadline,
+        # so agent queue wait does not burn the 2700-second pipeline budget.
         t_queue = time.time()
         async with gen.agent_concurrency_cm():
             queue_wait = time.time() - t_queue
+            pipeline_deadline = asyncio.get_running_loop().time() + guard
             t_agent = time.time()
-            async with asyncio.timeout(guard):
+            async with asyncio.timeout_at(pipeline_deadline):
                 async with make_sandbox(md["image"]) as sb:
                     await agent_runtime.prepare_workspace(
                         sb,
@@ -285,17 +286,20 @@ async def live_vanilla_runner(
                     del prompt_checkpoints
             agent_elapsed = time.time() - t_agent
 
-        # Eval / fan-out outside the agent concurrency slot.
-        t_eval = time.time()
-        eval_result = await gen._evaluate_diff(
-            image=md["image"],
-            workdir=md["workdir"],
-            eval_cmd=md["eval_cmd"],
-            diff_text=bundle.final_diff() if bundle else "",
-            timeout_sec=eval_timeout,
-            metadata={**(sample.metadata or {}), **md},
-        )
-        eval_elapsed = time.time() - t_eval
+        # Release the agent slot, but keep the same absolute deadline while
+        # queueing for an eval slot and running the clean-sandbox evaluator.
+        async with asyncio.timeout_at(pipeline_deadline):
+            t_eval = time.time()
+            eval_result = await gen._evaluate_diff(
+                image=md["image"],
+                workdir=md["workdir"],
+                eval_cmd=md["eval_cmd"],
+                diff_text=bundle.final_diff() if bundle else "",
+                timeout_sec=eval_timeout,
+                metadata={**(sample.metadata or {}), **md},
+            )
+            eval_elapsed = time.time() - t_eval
+        eval_queue_wait = float(eval_result.details.get("eval_queue_wait_sec") or 0.0)
         reward_path = getattr(
             args,
             "custom_cc_reward_function_path",
@@ -355,6 +359,7 @@ async def live_vanilla_runner(
                 "agent_elapsed_sec": agent_elapsed,
                 "agent_queue_wait_sec": queue_wait,
                 "eval_elapsed_sec": eval_elapsed,
+                "eval_queue_wait_sec": eval_queue_wait,
                 "total_elapsed_sec": time.time() - t0,
                 **f2p_p2p,
             },
@@ -484,14 +489,16 @@ async def live_branch_runner(
     )
     t0 = time.time()
     try:
-        # Acquire slot before the per-agent guard so queue wait does not burn
-        # the Claude/eval budget. Checkpoint/native state is loaded only after
+        # Acquire the agent slot before starting the shared Agent→eval deadline,
+        # so queue wait does not burn the 2700-second pipeline budget.
+        # Checkpoint/native state is loaded only after
         # admission so queued fan-out does not retain hundreds of prompt copies.
         t_queue = time.time()
         async with gen.agent_concurrency_cm():
             queue_wait = time.time() - t_queue
+            pipeline_deadline = asyncio.get_running_loop().time() + guard
             t_agent = time.time()
-            async with asyncio.timeout(guard):
+            async with asyncio.timeout_at(pipeline_deadline):
                 exact_ready, exact_error = bundle.token_exact_readiness(branch_step_t)
                 if not exact_ready:
                     raise RuntimeError(f"token_exact_bundle_not_ready:{exact_error}")
@@ -575,19 +582,22 @@ async def live_branch_runner(
                 del checkpoint, native_prefix
             agent_elapsed = time.time() - t_agent
 
-        # Eval / fan-out outside the agent concurrency slot.
-        t_eval = time.time()
-        eval_result = await gen._evaluate_diff(
-            image=image,
-            workdir=workdir,
-            eval_cmd=str(md.get("eval_cmd") or ""),
-            diff_text=cont_diff or "",
-            timeout_sec=eval_timeout,
-            # Prefer sample.metadata grading fields; bundle.task_metadata
-            # may be incomplete on older bundles.
-            metadata={**(sample.metadata or {}), **md},
-        )
-        eval_elapsed = time.time() - t_eval
+        # Release the agent slot, but keep the same absolute deadline while
+        # queueing for an eval slot and running the clean-sandbox evaluator.
+        async with asyncio.timeout_at(pipeline_deadline):
+            t_eval = time.time()
+            eval_result = await gen._evaluate_diff(
+                image=image,
+                workdir=workdir,
+                eval_cmd=str(md.get("eval_cmd") or ""),
+                diff_text=cont_diff or "",
+                timeout_sec=eval_timeout,
+                # Prefer sample.metadata grading fields; bundle.task_metadata
+                # may be incomplete on older bundles.
+                metadata={**(sample.metadata or {}), **md},
+            )
+            eval_elapsed = time.time() - t_eval
+        eval_queue_wait = float(eval_result.details.get("eval_queue_wait_sec") or 0.0)
         reward_path = getattr(
             args,
             "custom_cc_reward_function_path",
@@ -698,6 +708,7 @@ async def live_branch_runner(
                 "agent_elapsed_sec": agent_elapsed,
                 "agent_queue_wait_sec": queue_wait,
                 "eval_elapsed_sec": eval_elapsed,
+                "eval_queue_wait_sec": eval_queue_wait,
                 "total_elapsed_sec": time.time() - t0,
                 **f2p_p2p,
             },

@@ -551,6 +551,12 @@ def test_live_vanilla_runner_happy_path(tmp_path):
     eval_result = SimpleNamespace(resolved=False, applied_cleanly=True, details={})
     prepare_workspace = AsyncMock()
     capture_bundle = AsyncMock(return_value=bundle)
+    timeout_deadlines = []
+    real_timeout_at = asyncio.timeout_at
+
+    def record_timeout_at(deadline):
+        timeout_deadlines.append(deadline)
+        return real_timeout_at(deadline)
 
     async def _run():
         with patch.dict(os.environ, {"STEP_GRPO_BUNDLE_DIR": str(tmp_path)}), patch(
@@ -601,6 +607,9 @@ def test_live_vanilla_runner_happy_path(tmp_path):
         ), patch(
             "examples.claudecode_ags.step_reconstruct.live_runners.fan_out_sample_segments",
             return_value=[Sample(prompt="p", index=0, group_index=0, reward=0.0, metadata={})],
+        ), patch(
+            "examples.claudecode_ags.step_reconstruct.live_runners.asyncio.timeout_at",
+            side_effect=record_timeout_at,
         ):
             return await live_runners.live_vanilla_runner(
                 args=SimpleNamespace(hf_checkpoint="x"),
@@ -634,6 +643,8 @@ def test_live_vanilla_runner_happy_path(tmp_path):
     assert capture_kw["prompt_checkpoints"] == [{"checkpoint_id": "cp"}]
     assert capture_kw["cc_session_id"]
     adapter.export_prompt_checkpoints_async.assert_awaited_once_with("ccags-inst-0-0", clear=True)
+    assert len(timeout_deadlines) == 2
+    assert timeout_deadlines[0] == timeout_deadlines[1]
 
 
 def test_live_branch_runner_sets_step_group_key(tmp_path):
@@ -777,6 +788,12 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
 
     sample = Sample(prompt="p", index=0, group_index=3, metadata={})
     eval_result = SimpleNamespace(resolved=True, applied_cleanly=True, details={})
+    timeout_deadlines = []
+    real_timeout_at = asyncio.timeout_at
+
+    def record_timeout_at(deadline):
+        timeout_deadlines.append(deadline)
+        return real_timeout_at(deadline)
 
     def fake_fan_out(sample, segments, reward=0.0, tokenizer=None, metadata=None, rollout_id=None):
         s = Sample(prompt="p", index=1, group_index=3, reward=float(reward), response_length=2, metadata={})
@@ -828,6 +845,9 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
         ), patch(
             "examples.claudecode_ags.step_reconstruct.live_runners.fan_out_sample_segments",
             side_effect=fake_fan_out,
+        ), patch(
+            "examples.claudecode_ags.step_reconstruct.live_runners.asyncio.timeout_at",
+            side_effect=record_timeout_at,
         ):
             return await live_runners.live_branch_runner(
                 args=SimpleNamespace(hf_checkpoint="x"),
@@ -863,6 +883,9 @@ def test_live_branch_runner_sets_step_group_key(tmp_path):
     assert samples[0].metadata["resume_last_stop_reason"] == "end_turn"
     assert samples[0].metadata["stage2_loss_scope"] == "full_continuation"
     assert "agent_queue_wait_sec" in samples[0].metadata
+    assert samples[0].metadata["eval_queue_wait_sec"] == 0.0
+    assert len(timeout_deadlines) == 2
+    assert timeout_deadlines[0] == timeout_deadlines[1]
     # Do not force all-1s loss_mask (breaks TIS); fan_out owns the mask.
     assert samples[0].loss_mask is None
     assert samples[0].rollout_id == 0

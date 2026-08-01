@@ -201,6 +201,55 @@ def test_anthropic_messages_nonstream_records_token_segments():
     asyncio.run(run_case())
 
 
+def test_anthropic_sampling_overrides_win_over_request_body():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 111)]]) as sglang:
+            tok = FakeTokenizer(outputs={(111,): "done"})
+            adapter = anthropic.AnthropicAdapter(tokenizer=tok, sglang_url=sglang.url)
+            adapter.open_session(
+                "sid-profile",
+                sampling_defaults={
+                    "temperature": 0.8,
+                    "top_p": 0.9,
+                    "top_k": 40,
+                    "max_new_tokens": 99,
+                },
+                sampling_overrides={
+                    "temperature": 0.6,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                },
+            )
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            try:
+                resp = await client.post(
+                    "/v1/messages",
+                    headers={"Authorization": "Bearer sid-profile"},
+                    json={
+                        "model": "m",
+                        "max_tokens": 7,
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": -1,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                await resp.json()
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-profile")
+
+        params = sglang.requests[0]["sampling_params"]
+        assert params["temperature"] == 0.6
+        assert params["top_p"] == 0.95
+        assert params["top_k"] == 20
+        # The client may still lower the response-token ceiling.
+        assert params["max_new_tokens"] == 7
+
+    asyncio.run(run_case())
+
+
 def test_openai_chat_completions_nonstream_records_token_segments():
     async def run_case():
         async with FakeSGLangServer([[(-0.3, 201)]]) as sglang:

@@ -81,6 +81,10 @@ export SLIME_SGLANG_CONTEXT_SAFETY_MARGIN
 ROLLOUT_MAX_PROMPT_LEN="${ROLLOUT_MAX_PROMPT_LEN:-4160}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-131072}"
 MAX_GEN_LEN="${MAX_GEN_LEN:-16384}"
+# SWE task descriptions are inputs to the external coding agent, not ordinary
+# rollout prefixes.  Do not silently filter long eval tasks with the much
+# smaller training-prompt limit.
+EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-${MAX_CONTEXT_LEN}}"
 export ROLLOUT_MAX_CONTEXT_LEN="${ROLLOUT_MAX_CONTEXT_LEN:-128000}"
 export ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-${MAX_GEN_LEN}}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((MAX_CONTEXT_LEN / CP_SIZE))}"
@@ -171,6 +175,7 @@ source "${MODEL_SCRIPT}"
 
 # LOAD_PATH/SAVE_PATH: override for eval-only (e.g. Base loads REF megatron dir).
 LOAD_PATH="${LOAD_PATH:-${LOG_DIR}/slime_save}"
+LOAD_CKPT_STEP="${LOAD_CKPT_STEP:-}"
 SAVE_PATH="${SAVE_PATH:-${LOG_DIR}/slime_save}"
 CKPT_ARGS=(
   --hf-checkpoint "${HF_CHECKPOINT}"
@@ -179,6 +184,13 @@ CKPT_ARGS=(
   --save "${SAVE_PATH}"
   --save-interval "${SAVE_INTERVAL}"
 )
+if [[ -n "${LOAD_CKPT_STEP}" ]]; then
+  if [[ ! "${LOAD_CKPT_STEP}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: LOAD_CKPT_STEP must be a non-negative integer, got: ${LOAD_CKPT_STEP}" >&2
+    exit 2
+  fi
+  CKPT_ARGS+=(--ckpt-step "${LOAD_CKPT_STEP}")
+fi
 
 ROLLOUT_ARGS=(
   --prompt-data "${PROMPT_DATA}"
@@ -220,7 +232,7 @@ if [[ "${PHASE}" == "all" || "${PHASE}" == "eval" ]]; then
     --eval-interval "${EVAL_INTERVAL}"
     --eval-prompt-data swebench_verified "${EVAL_DATA}"
     --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}"
-    --eval-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}"
+    --eval-max-prompt-len "${EVAL_MAX_PROMPT_LEN}"
     --eval-max-response-len "${MAX_GEN_LEN}"
   )
   if [[ "${SKIP_EVAL_BEFORE_TRAIN}" = "1" ]]; then

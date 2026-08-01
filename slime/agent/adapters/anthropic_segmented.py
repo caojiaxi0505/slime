@@ -248,6 +248,7 @@ class Session:
     active_sub: Chain | None = None
     pending_dispatch_id: str = ""
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
+    sampling_overrides: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
     capture_prompt_checkpoints: bool = False
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
@@ -1529,6 +1530,7 @@ class SegmentedAnthropicAdapter:
         self,
         *,
         sampling_defaults: dict | None,
+        sampling_overrides: dict | None,
         max_context_tokens: int,
         capture_prompt_checkpoints: bool,
         resume_checkpoint: PromptCheckpoint | dict[str, Any] | None,
@@ -1536,6 +1538,7 @@ class SegmentedAnthropicAdapter:
         """Construct and validate one Session without publishing it in store."""
         session = Session(
             sampling_defaults=dict(sampling_defaults or {}),
+            sampling_overrides=dict(sampling_overrides or {}),
             max_context_tokens=int(max_context_tokens or 0),
             capture_prompt_checkpoints=bool(capture_prompt_checkpoints),
             adapter_cpu_workers=self.cpu_workers,
@@ -1578,6 +1581,7 @@ class SegmentedAnthropicAdapter:
         sid: str,
         *,
         sampling_defaults: dict | None = None,
+        sampling_overrides: dict | None = None,
         max_context_tokens: int = 0,
         capture_prompt_checkpoints: bool = False,
         resume_checkpoint: PromptCheckpoint | dict[str, Any] | None = None,
@@ -1586,6 +1590,7 @@ class SegmentedAnthropicAdapter:
             raise ValueError(f"session_id {sid!r} already exists; sids must be unique per agent run")
         session = self._new_session(
             sampling_defaults=sampling_defaults,
+            sampling_overrides=sampling_overrides,
             max_context_tokens=max_context_tokens,
             capture_prompt_checkpoints=capture_prompt_checkpoints,
             resume_checkpoint=resume_checkpoint,
@@ -1597,6 +1602,7 @@ class SegmentedAnthropicAdapter:
         sid: str,
         *,
         sampling_defaults: dict | None = None,
+        sampling_overrides: dict | None = None,
         max_context_tokens: int = 0,
         capture_prompt_checkpoints: bool = False,
         resume_checkpoint: PromptCheckpoint | dict[str, Any] | None = None,
@@ -1606,6 +1612,7 @@ class SegmentedAnthropicAdapter:
             self.open_session(
                 sid,
                 sampling_defaults=sampling_defaults,
+                sampling_overrides=sampling_overrides,
                 max_context_tokens=max_context_tokens,
                 capture_prompt_checkpoints=capture_prompt_checkpoints,
             )
@@ -1616,6 +1623,7 @@ class SegmentedAnthropicAdapter:
             functools.partial(
                 self._new_session,
                 sampling_defaults=sampling_defaults,
+                sampling_overrides=sampling_overrides,
                 max_context_tokens=max_context_tokens,
                 capture_prompt_checkpoints=capture_prompt_checkpoints,
                 resume_checkpoint=resume_checkpoint,
