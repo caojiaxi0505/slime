@@ -295,15 +295,28 @@ class AGSSandbox:
         ):
             raise RuntimeError("AGSSandbox is not started")
 
-        # SWE-ReX HTTP client timeout is independent of Command.timeout.
+        # SWE-ReX HTTP client timeout is independent of Command.timeout. Keep
+        # the runtime request alive slightly longer than the server command.
+        # Older SWE-ReX builds read SWEREX_REQUEST_TIMEOUT while newer builds
+        # use runtime._config.timeout, so set both for compatibility.
         needed = int(timeout) + 60
         raw = os.environ.get("SWEREX_REQUEST_TIMEOUT", "")
         try:
-            current = float(raw) if raw else 120.0
+            env_timeout = float(raw) if raw else 0.0
         except ValueError:
-            current = 120.0
-        if current < needed:
+            env_timeout = 0.0
+        if env_timeout < needed:
             os.environ["SWEREX_REQUEST_TIMEOUT"] = str(needed)
+        # Some SWE-ReX builds silently retry a timed-out HTTP request up to
+        # five times, multiplying a long evaluator timeout. Higher-level AGS
+        # retries already handle retryable infrastructure failures explicitly.
+        os.environ.setdefault("SWEREX_REQUEST_RETRIES", "0")
+        try:
+            current = float(self._deployment.runtime._config.timeout)
+        except (AttributeError, TypeError, ValueError):
+            current = 0.0
+        if current < needed:
+            self._deployment.runtime._config.timeout = float(needed)
 
         command = self._rex_command_cls(
             command=self._wrap_cmd(cmd, user=user, env=env),

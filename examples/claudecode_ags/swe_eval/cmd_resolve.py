@@ -15,6 +15,7 @@ from examples.claudecode_ags.workspace_init import coerce_install_config, normal
 class EvalMode(str, Enum):
     SCALESWE = "scaleswe"
     REBENCH = "rebench"
+    SWEGYM = "swegym"
     SWEBENCH = "swebench"
     SIMPLE_CMD = "simple_cmd"
     NONE = "none"
@@ -87,6 +88,10 @@ def detect_eval_mode(md: dict[str, Any]) -> EvalMode:
     f2p = parse_list(_md_get(md, "FAIL_TO_PASS", "fail_to_pass"))
     p2p = parse_list(_md_get(md, "PASS_TO_PASS", "pass_to_pass"))
     repo = str(_md_get(md, "repo") or "").strip()
+    dataset_type = str(_md_get(md, "dataset_type") or "").strip().lower()
+    data_source = str(_md_get(md, "data_source") or "").strip().lower()
+    if "swegym" in {dataset_type, data_source} and repo and (f2p or p2p):
+        return EvalMode.SWEGYM
     if repo and (f2p or p2p):
         return EvalMode.SWEBENCH
 
@@ -144,6 +149,24 @@ def resolve_eval_plan(md: dict[str, Any]) -> EvalPlan:
             repo=repo,
             log_parser=log_parser or "parse_log_pytest",
             details={"install_config_keys": sorted(install_config.keys())},
+        )
+
+    if mode == EvalMode.SWEGYM:
+        # SWE-Gym images predate the official SWE-bench TestSpec registry and
+        # include repositories that are not present in it. Run the row's
+        # explicit F2P/P2P nodeids and grade their pytest output instead.
+        return EvalPlan(
+            mode=mode,
+            eval_cmd=_pytest_cmd(workdir, f2p + p2p),
+            workdir=workdir,
+            test_patch=test_patch,
+            fail_to_pass=f2p,
+            pass_to_pass=p2p,
+            repo=repo,
+            details={
+                "version": str(_md_get(md, "version") or ""),
+                "runner": "swegym_pytest",
+            },
         )
 
     if mode == EvalMode.SWEBENCH:

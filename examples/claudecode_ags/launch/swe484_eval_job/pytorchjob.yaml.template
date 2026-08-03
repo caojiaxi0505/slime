@@ -47,6 +47,27 @@ ${K8S_TARGET_NODE_AFFINITY}          containers:
                   sed -i 's|cd /cfs_turbo|cd /|' ~/.bashrc || true
                   ray stop --force 2>/dev/null || true
                   cd "${SLIME_DIR}"
+                  echo "=== SWE-ReX import audit ==="
+                  python3 - <<'PY'
+                  import os
+                  import sys
+                  from pathlib import Path
+
+                  expected = Path(os.environ["SLIME_AGENT_AGS_SWE_REX_ROOT"]).resolve()
+                  if not expected.is_dir():
+                      raise SystemExit(f"ERROR: expected SWE-ReX root does not exist: {expected}")
+                  sys.path.insert(0, str(expected))
+                  import swerex
+
+                  actual = Path(swerex.__file__).resolve()
+                  try:
+                      actual.relative_to(expected)
+                  except ValueError:
+                      raise SystemExit(
+                          f"ERROR: loaded SWE-ReX from {actual}; expected it under {expected}"
+                      )
+                  print(f"SWE-ReX import OK: {actual}")
+                  PY
                   echo "=== install pinned official SWE-bench ==="
                   python3 -m pip install \
                     --disable-pip-version-check \
@@ -259,6 +280,10 @@ ${K8S_TARGET_NODE_AFFINITY}          containers:
                   value: "${SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC}"
                 - name: SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC
                   value: "${SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC}"
+                - name: SLIME_AGENT_AGS_SWE_REX_ROOT
+                  value: ${SLIME_AGENT_AGS_SWE_REX_ROOT}
+                - name: SWEREX_REQUEST_RETRIES
+                  value: "0"
                 - name: PATH
                   value: /root/miniconda3/envs/agent-lightning/bin:/root/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
                 - name: NCCL_SOCKET_IFNAME

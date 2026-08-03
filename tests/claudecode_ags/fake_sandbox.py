@@ -6,6 +6,7 @@ import re
 
 _POLL_RE = re.compile(r"test -f (\S+) && cat \1")
 _SETSID_RE = re.compile(r"setsid bash (\S+)")
+_CAT_RE = re.compile(r"^cat (\S+)$")
 
 
 class FakeSandbox:
@@ -39,11 +40,6 @@ class FakeSandbox:
 
         m = _SETSID_RE.search(cmd)
         if m:
-            launcher = m.group(1)
-            body = self.files.get(launcher, "")
-            if "echo $? >" in body:
-                done = body.rsplit("echo $? >", 1)[-1].strip()
-                self.files[done] = "0"
             return 0, "", ""
 
         poll = _POLL_RE.search(cmd)
@@ -52,6 +48,13 @@ class FakeSandbox:
             if path in self.files:
                 return 0, self.files[path], ""
             return 1, "", ""
+
+        cat = _CAT_RE.match(cmd)
+        if cat:
+            path = cat.group(1)
+            if path in self.files:
+                return 0, self.files[path], ""
+            return 1, "", "not found"
 
         return 0, "", ""
 

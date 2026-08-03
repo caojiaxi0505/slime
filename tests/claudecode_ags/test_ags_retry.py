@@ -232,6 +232,8 @@ def test_non_idempotent_exec_uses_swerex_runtime_execute(monkeypatch):
     runtime_calls = []
 
     class FakeRuntime:
+        _config = SimpleNamespace(timeout=120.0)
+
         async def execute(self, command):
             runtime_calls.append(command)
             return SimpleNamespace(exit_code=0, stdout="ok", stderr="")
@@ -281,3 +283,30 @@ def test_ags_runtime_request_timeout_defaults_to_2700(monkeypatch):
     kwargs = sandbox_ags.AGSSandbox("image")._deployment_kwargs(required)
 
     assert kwargs["runtime_timeout"] == 2700.0
+
+
+def test_exec_extends_runtime_request_timeout_past_command_timeout(monkeypatch):
+    monkeypatch.delenv("SWEREX_REQUEST_TIMEOUT", raising=False)
+    monkeypatch.delenv("SWEREX_REQUEST_RETRIES", raising=False)
+
+    class Config:
+        timeout = 120.0
+
+    class Runtime:
+        _config = Config()
+
+        async def execute(self, command):
+            del command
+            return SimpleNamespace(exit_code=0, stdout="ok", stderr="")
+
+    sb = sandbox_ags.AGSSandbox("image")
+    sb._deployment = SimpleNamespace(runtime=Runtime())
+    sb._rex_command_cls = lambda **values: SimpleNamespace(**values)
+    sb._rex_command_response_cls = SimpleNamespace
+
+    result = asyncio.run(sb.exec("true", timeout=2700, idempotent=False))
+
+    assert result == (0, "ok", "")
+    assert sb._deployment.runtime._config.timeout == 2760.0
+    assert sandbox_ags.os.environ["SWEREX_REQUEST_TIMEOUT"] == "2760"
+    assert sandbox_ags.os.environ["SWEREX_REQUEST_RETRIES"] == "0"

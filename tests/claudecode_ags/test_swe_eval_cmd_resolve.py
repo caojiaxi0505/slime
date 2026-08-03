@@ -25,6 +25,17 @@ def test_detect_swebench_by_repo_and_f2p():
     assert detect_eval_mode(md) == EvalMode.SWEBENCH
 
 
+def test_detect_swegym_before_official_swebench():
+    md = {
+        "dataset_type": "swegym",
+        "data_source": "swegym",
+        "repo": "conan-io/conan",
+        "FAIL_TO_PASS": ["test::a"],
+        "PASS_TO_PASS": ["test::b"],
+    }
+    assert detect_eval_mode(md) == EvalMode.SWEGYM
+
+
 def test_detect_simple_cmd_fallback():
     assert detect_eval_mode({"eval_cmd": "true"}) == EvalMode.SIMPLE_CMD
 
@@ -88,6 +99,34 @@ def test_swebench_plan_uses_official_eval_script(monkeypatch):
     assert plan.test_patch == ""
     assert plan.official_test_spec is test_spec
     assert plan.details["runner"] == "official_swebench"
+
+
+def test_swegym_plan_uses_explicit_tests_without_official_spec(monkeypatch):
+    def fail_if_called(metadata):
+        raise AssertionError("SWE-Gym must not use the official TestSpec registry")
+
+    monkeypatch.setattr(
+        "examples.claudecode_ags.swe_eval.official.make_official_test_spec",
+        fail_if_called,
+    )
+    plan = resolve_eval_plan(
+        {
+            "dataset_type": "swegym",
+            "data_source": "swegym",
+            "repo": "conan-io/conan",
+            "version": "1.0",
+            "FAIL_TO_PASS": ["test::fails_before_patch"],
+            "PASS_TO_PASS": ["test::regression"],
+            "test_patch": "diff --git a/test.py b/test.py\n",
+        }
+    )
+    assert plan.mode == EvalMode.SWEGYM
+    assert "python -m pytest" in plan.eval_cmd
+    assert "test::fails_before_patch" in plan.eval_cmd
+    assert "test::regression" in plan.eval_cmd
+    assert plan.test_patch.startswith("diff --git")
+    assert plan.official_test_spec is None
+    assert plan.details["runner"] == "swegym_pytest"
 
 
 def test_priority_scaleswe_over_rebench():

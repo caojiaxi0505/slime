@@ -9,6 +9,7 @@ import pytest
 from examples.claudecode_ags.swe_eval import rebench as rebench_mod
 from examples.claudecode_ags.swe_eval import scaleswe as scaleswe_mod
 from examples.claudecode_ags.swe_eval import swebench as swebench_mod
+from examples.claudecode_ags.swe_eval import swegym as swegym_mod
 
 _F2P = "tests/test_bug.py::test_fixed"
 _P2P = "tests/test_reg.py::test_ok"
@@ -54,6 +55,19 @@ def test_swebench_grade_requires_official_test_spec():
             stdout=_PASS_LOG,
             stderr="",
         )
+
+
+def test_swegym_grade_does_not_require_official_test_spec():
+    grade = swegym_mod.grade_logs(
+        repo="conan-io/conan",
+        fail_to_pass=[_F2P],
+        pass_to_pass=[_P2P],
+        stdout=_PASS_LOG,
+        stderr="",
+    )
+    assert grade["resolved"] is True
+    assert grade["reward_tests_status"]["FAIL_TO_PASS"]["pass_ratio"] == 1.0
+    assert grade["reward_tests_status"]["PASS_TO_PASS"]["pass_ratio"] == 1.0
 
 
 def test_swebench_grade_uses_only_official_parser(monkeypatch):
