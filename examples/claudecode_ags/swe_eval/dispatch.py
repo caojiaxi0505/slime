@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import random
+import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 from examples.claudecode_ags.swe_eval import rebench as rebench_mod
@@ -20,6 +24,47 @@ _MODEL_PATCH = "/tmp/slime_model_patch.diff"
 _TEST_PATCH = "/tmp/slime_test_patch.diff"
 _F2P_PATCH = "/tmp/slime_f2p_patch.diff"
 _F2P_SCRIPT = "test_fail_to_pass.py"
+_EVAL_CONTROL_SEM: asyncio.Semaphore | None = None
+_EVAL_CONTROL_SEM_LIMIT: int | None = None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("[swe_eval.dispatch] invalid %s=%r; using %d", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("[swe_eval.dispatch] invalid %s=%r; using %.1f", name, raw, default)
+        return default
+
+
+@asynccontextmanager
+async def _eval_control_slot():
+    """Limit short eval-control AGS requests without throttling agent rollout."""
+    global _EVAL_CONTROL_SEM, _EVAL_CONTROL_SEM_LIMIT
+    limit = _env_int("SLIME_CC_EVAL_CONTROL_CONCURRENCY", 64)
+    if limit <= 0:
+        yield 0.0
+        return
+    if _EVAL_CONTROL_SEM is None or _EVAL_CONTROL_SEM_LIMIT != limit:
+        _EVAL_CONTROL_SEM = asyncio.Semaphore(limit)
+        _EVAL_CONTROL_SEM_LIMIT = limit
+        logger.info("[swe_eval.dispatch] eval control concurrency limit=%d", limit)
+    queued_at = time.monotonic()
+    async with _EVAL_CONTROL_SEM:
+        yield time.monotonic() - queued_at
 
 
 async def _apply_patch(sb, workdir: str, path: str, diff_text: str) -> tuple[bool, str]:
@@ -146,13 +191,34 @@ printf '%s\n' "$supervisor_pid" > {supervisor_pid_path}
 """
     await sb.write_file(launcher, launcher_body, user="agent")
 
+    eval_control_queue_wait_sec = 0.0
+    eval_control_exec_count = 0
+
+    async def _control_exec(
+        cmd: str,
+        *,
+        check: bool = False,
+        timeout: int = 120,
+        idempotent: bool = True,
+    ):
+        nonlocal eval_control_queue_wait_sec, eval_control_exec_count
+        async with _eval_control_slot() as queue_wait:
+            eval_control_queue_wait_sec += queue_wait
+            eval_control_exec_count += 1
+            return await sb.exec(
+                cmd,
+                user="agent",
+                check=check,
+                timeout=timeout,
+                idempotent=idempotent,
+            )
+
     # Do not keep one AGS/SWE-ReX HTTP /execute request open for the whole test.
     # Some server builds fail to return that request after long test processes
     # exit. Start a fully redirected background supervisor, then use short HTTP
     # requests to poll an atomically-written status file and fetch the log.
-    launch_ec, _, launch_stderr = await sb.exec(
+    launch_ec, _, launch_stderr = await _control_exec(
         f"chmod 755 {launcher} && bash {launcher}",
-        user="agent",
         check=False,
         timeout=60,
         idempotent=False,
@@ -160,19 +226,33 @@ printf '%s\n' "$supervisor_pid" > {supervisor_pid_path}
     if launch_ec != 0:
         raise RuntimeError(f"failed to launch background evaluator: {launch_stderr[:1000]}")
 
-    poll_interval_sec = 15
-    completion_grace_sec = 60
+    poll_interval_sec = max(1.0, _env_float("SLIME_CC_EVAL_POLL_INTERVAL_SEC", 60.0))
+    poll_jitter_sec = max(0.0, _env_float("SLIME_CC_EVAL_POLL_JITTER_SEC", 10.0))
+    completion_grace_sec = max(
+        60.0,
+        _env_float(
+            "SLIME_CC_EVAL_COMPLETION_GRACE_SEC",
+            poll_interval_sec + poll_jitter_sec + 20.0,
+        ),
+    )
     deadline = asyncio.get_running_loop().time() + timeout_sec + completion_grace_sec
     ec: int | None = None
     last_poll_error = ""
     client_poll_timed_out = False
+    if poll_jitter_sec > 0:
+        await asyncio.sleep(
+            min(
+                random.uniform(0.0, poll_jitter_sec),
+                max(0.0, deadline - asyncio.get_running_loop().time()),
+            )
+        )
     while ec is None:
         try:
-            poll_ec, poll_out, poll_err = await sb.exec(
+            poll_ec, poll_out, poll_err = await _control_exec(
                 f"test -f {status_path} && cat {status_path}",
-                user="agent",
                 check=False,
                 timeout=30,
+                idempotent=True,
             )
             if poll_ec == 0 and poll_out.strip():
                 try:
@@ -191,30 +271,36 @@ printf '%s\n' "$supervisor_pid" > {supervisor_pid_path}
             client_poll_timed_out = True
             ec = 124
             try:
-                await sb.exec(
+                await _control_exec(
                     f"test -s {test_pid_path} && "
                     f"kill -KILL -- -$(cat {test_pid_path}) 2>/dev/null || true; "
                     f"test -s {supervisor_pid_path} && "
                     f"kill -KILL -- -$(cat {supervisor_pid_path}) 2>/dev/null || true",
-                    user="agent",
                     check=False,
                     timeout=30,
+                    idempotent=True,
                 )
             except Exception as exc:
                 last_poll_error = f"cleanup {type(exc).__name__}: {exc}"
             break
-        await asyncio.sleep(min(poll_interval_sec, remaining))
+        sleep_sec = min(poll_interval_sec, remaining)
+        if remaining > sleep_sec and poll_jitter_sec > 0:
+            sleep_sec += min(
+                random.uniform(0.0, poll_jitter_sec),
+                max(0.0, remaining - sleep_sec),
+            )
+        await asyncio.sleep(max(0.0, sleep_sec))
 
-    log_ec, stdout, log_stderr = await sb.exec(
-        f"cat {output_path}", user="agent", check=False, timeout=180
+    log_ec, stdout, log_stderr = await _control_exec(
+        f"cat {output_path}", check=False, timeout=180, idempotent=True
     )
     if log_ec != 0:
         raise RuntimeError(f"failed to fetch evaluator output: {log_stderr[:1000]}")
-    _, supervisor_stderr, _ = await sb.exec(
+    _, supervisor_stderr, _ = await _control_exec(
         f"test -f {supervisor_output_path} && cat {supervisor_output_path}",
-        user="agent",
         check=False,
         timeout=60,
+        idempotent=True,
     )
     stderr = supervisor_stderr or last_poll_error
     command_timed_out = ec in {124, 137}
@@ -269,7 +355,11 @@ printf '%s\n' "$supervisor_pid" > {supervisor_pid_path}
         "test_timeout_sec": timeout_sec,
         "eval_execution_protocol": "background_poll_v1",
         "eval_poll_interval_sec": poll_interval_sec,
+        "eval_poll_jitter_sec": poll_jitter_sec,
         "eval_completion_grace_sec": completion_grace_sec,
+        "eval_control_concurrency": _env_int("SLIME_CC_EVAL_CONTROL_CONCURRENCY", 64),
+        "eval_control_exec_count": eval_control_exec_count,
+        "eval_control_queue_wait_sec": eval_control_queue_wait_sec,
         "stdout": (stdout or "")[-8000:],
         "stderr": (stderr or "")[-4000:],
         **grade,

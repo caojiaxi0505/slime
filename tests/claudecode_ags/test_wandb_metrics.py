@@ -364,6 +364,7 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
             "agent_queue_wait_sec": 3.0,
             "hybrid_num_stage1_planned_trials": 8,
             "hybrid_num_stage1_aborted_placeholders": 2,
+            "hybrid_num_stage1_cancelled_placeholders": 1,
             "hybrid_num_patch_candidates": 2,
             "hybrid_num_selected_edits": 1,
             "hybrid_num_branch_tasks": 8,
@@ -376,6 +377,7 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
             "hybrid_stage2_max_loss_tokens": 12000,
             "hybrid_num_dropped_branches": 2,
             "hybrid_num_dropped_timeout": 0,
+            "hybrid_num_dropped_cancelled": 1,
             "hybrid_num_dropped_resume_tool_echo": 1,
             "hybrid_num_dropped_resume_missing_result": 0,
             "hybrid_num_dropped_resume_no_pending": 1,
@@ -445,7 +447,9 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
     assert m["perf/step_grpo/branch_loss_weight"] == 2.0
     assert m["perf/step_grpo/n_stage1_planned_trials"] == 8.0
     assert m["perf/step_grpo/n_stage1_aborted_placeholders"] == 2.0
+    assert m["perf/step_grpo/n_stage1_cancelled_placeholders"] == 1.0
     assert m["perf/step_grpo/stage1_aborted_placeholder_rate"] == 0.25
+    assert m["perf/step_grpo/stage1_cancelled_placeholder_rate"] == 0.125
     assert m["perf/step_grpo/n_patch_candidates"] == 2.0
     assert m["perf/step_grpo/n_branch_tasks"] == 8.0
     assert m["perf/step_grpo/n_stage2_samples_before_length_filter"] == 10.0
@@ -460,6 +464,7 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
     assert m["perf/step_grpo/n_completed_branches"] == 6.0
     assert m["perf/step_grpo/branch_completion_rate"] == 0.75
     assert m["perf/step_grpo/branch_drop_rate"] == 0.25
+    assert m["perf/step_grpo/n_dropped_cancelled"] == 1.0
     assert m["perf/step_grpo/n_dropped_resume_tool_echo"] == 1.0
     assert m["perf/step_grpo/n_dropped_resume_no_pending"] == 1.0
     assert m["resume/prompt_exact_rate"] == 1.0

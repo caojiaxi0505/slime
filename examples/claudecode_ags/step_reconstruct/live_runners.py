@@ -41,6 +41,32 @@ from slime.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+class HybridPipelineTimeoutError(TimeoutError):
+    """Timeout with enough context for Stage-1/Stage-2 health metrics."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        phase: str,
+        instance_id: str,
+        guard_sec: int,
+        elapsed_sec: float,
+        detail: str = "",
+    ) -> None:
+        self.stage = stage
+        self.phase = phase
+        self.instance_id = instance_id
+        self.guard_sec = int(guard_sec)
+        self.elapsed_sec = float(elapsed_sec)
+        self.bucket = f"timeout_{phase}"
+        suffix = f" detail={detail}" if detail else ""
+        super().__init__(
+            f"pipeline_timeout:{stage}:{phase} instance={instance_id} "
+            f"guard_sec={self.guard_sec} elapsed_sec={self.elapsed_sec:.1f}{suffix}"
+        )
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or str(raw).strip() == "":
@@ -221,84 +247,104 @@ async def live_vanilla_runner(
             queue_wait = time.time() - t_queue
             pipeline_deadline = asyncio.get_running_loop().time() + guard
             t_agent = time.time()
-            async with asyncio.timeout_at(pipeline_deadline):
-                async with make_sandbox(md["image"]) as sb:
-                    await agent_runtime.prepare_workspace(
-                        sb,
-                        workdir=md["workdir"],
-                        problem_statement=md["problem_statement"],
-                        instance_id=md["instance_id"],
-                        data_source=md["data_source"],
-                        base_commit=md["base_commit"],
-                        swe_smith_bug_patch=md.get("swe_smith_bug_patch"),
-                        pre_commands=md.get("pre_commands") or "",
-                        install_config=md.get("install_config") or {},
-                        rollout_side=True,
-                    )
-                    await agent_runtime.install_toolchain(sb)
-                    await install_snapshot_hook(sb, md["workdir"])
-                    initial_diff = await _common.workspace_diff(sb, md["workdir"])
-                    await capture_initial_workspace_metadata(sb, md["workdir"])
-                    agent_result = await agent_runtime.run_claude(
-                        sb,
-                        workdir=md["workdir"],
-                        prompt=md["agent_prompt"],
-                        env=claude_env,
-                        time_budget_sec=time_budget,
-                        claude_session_id=cc_session_id,
-                    )
-                    # Prefer HEAD-aligned diff used by snapshot script.
-                    final_diff = await _common.workspace_diff(sb, md["workdir"])
-                    if not (final_diff or "").strip():
-                        final_diff = await agent_runtime.git_diff(sb, workdir=md["workdir"])
+            try:
+                async with asyncio.timeout_at(pipeline_deadline):
+                    async with make_sandbox(md["image"]) as sb:
+                        await agent_runtime.prepare_workspace(
+                            sb,
+                            workdir=md["workdir"],
+                            problem_statement=md["problem_statement"],
+                            instance_id=md["instance_id"],
+                            data_source=md["data_source"],
+                            base_commit=md["base_commit"],
+                            swe_smith_bug_patch=md.get("swe_smith_bug_patch"),
+                            pre_commands=md.get("pre_commands") or "",
+                            install_config=md.get("install_config") or {},
+                            rollout_side=True,
+                        )
+                        await agent_runtime.install_toolchain(sb)
+                        await install_snapshot_hook(sb, md["workdir"])
+                        initial_diff = await _common.workspace_diff(sb, md["workdir"])
+                        await capture_initial_workspace_metadata(sb, md["workdir"])
+                        agent_result = await agent_runtime.run_claude(
+                            sb,
+                            workdir=md["workdir"],
+                            prompt=md["agent_prompt"],
+                            env=claude_env,
+                            time_budget_sec=time_budget,
+                            claude_session_id=cc_session_id,
+                        )
+                        # Prefer HEAD-aligned diff used by snapshot script.
+                        final_diff = await _common.workspace_diff(sb, md["workdir"])
+                        if not (final_diff or "").strip():
+                            final_diff = await agent_runtime.git_diff(sb, workdir=md["workdir"])
 
-                    # Preserve official grading fields (FAIL_TO_PASS, repo, …) —
-                    # same merge as generate.py. _parse_metadata alone strips them.
-                    task_md = {
-                        **(sample.metadata or {}),
-                        **md,
-                        "image": md["image"],
-                        "workdir": md["workdir"],
-                        "problem_statement": md["problem_statement"],
-                        "eval_cmd": md["eval_cmd"],
-                        "agent_prompt": md["agent_prompt"],
-                    }
-                    exporter = getattr(state.adapter, "export_prompt_checkpoints_async", None)
-                    prompt_checkpoints = (
-                        await exporter(session_id, clear=True) if callable(exporter) else []
-                    )
-                    if not isinstance(prompt_checkpoints, list):
-                        prompt_checkpoints = []
-                    bundle = await capture_snapshots_to_bundle(
-                        sb,
-                        out_dir=out_dir,
-                        workdir=md["workdir"],
-                        instance_id=instance_id,
-                        session_id=session_id,
-                        task_metadata=task_md,
-                        initial_diff=initial_diff or "",
-                        final_diff=final_diff or "",
-                        transcript_text=str(agent_result.get("trajectory_jsonl") or ""),
-                        claude_exit_code=int(agent_result.get("exit_code") or 0),
-                        cc_session_id=cc_session_id,
-                        prompt_checkpoints=prompt_checkpoints,
-                    )
-                    del prompt_checkpoints
+                        # Preserve official grading fields (FAIL_TO_PASS, repo, …) —
+                        # same merge as generate.py. _parse_metadata alone strips them.
+                        task_md = {
+                            **(sample.metadata or {}),
+                            **md,
+                            "image": md["image"],
+                            "workdir": md["workdir"],
+                            "problem_statement": md["problem_statement"],
+                            "eval_cmd": md["eval_cmd"],
+                            "agent_prompt": md["agent_prompt"],
+                        }
+                        exporter = getattr(state.adapter, "export_prompt_checkpoints_async", None)
+                        prompt_checkpoints = (
+                            await exporter(session_id, clear=True) if callable(exporter) else []
+                        )
+                        if not isinstance(prompt_checkpoints, list):
+                            prompt_checkpoints = []
+                        bundle = await capture_snapshots_to_bundle(
+                            sb,
+                            out_dir=out_dir,
+                            workdir=md["workdir"],
+                            instance_id=instance_id,
+                            session_id=session_id,
+                            task_metadata=task_md,
+                            initial_diff=initial_diff or "",
+                            final_diff=final_diff or "",
+                            transcript_text=str(agent_result.get("trajectory_jsonl") or ""),
+                            claude_exit_code=int(agent_result.get("exit_code") or 0),
+                            cc_session_id=cc_session_id,
+                            prompt_checkpoints=prompt_checkpoints,
+                        )
+                        del prompt_checkpoints
+            except asyncio.TimeoutError as exc:
+                raise HybridPipelineTimeoutError(
+                    stage="stage1",
+                    phase="agent_pipeline",
+                    instance_id=instance_id,
+                    guard_sec=guard,
+                    elapsed_sec=time.time() - t_agent,
+                    detail="sandbox_prepare_toolchain_agent_snapshot",
+                ) from exc
             agent_elapsed = time.time() - t_agent
 
         # Release the agent slot, but keep the same absolute deadline while
         # queueing for an eval slot and running the clean-sandbox evaluator.
-        async with asyncio.timeout_at(pipeline_deadline):
-            t_eval = time.time()
-            eval_result = await gen._evaluate_diff(
-                image=md["image"],
-                workdir=md["workdir"],
-                eval_cmd=md["eval_cmd"],
-                diff_text=bundle.final_diff() if bundle else "",
-                timeout_sec=eval_timeout,
-                metadata={**(sample.metadata or {}), **md},
-            )
-            eval_elapsed = time.time() - t_eval
+        try:
+            async with asyncio.timeout_at(pipeline_deadline):
+                t_eval = time.time()
+                eval_result = await gen._evaluate_diff(
+                    image=md["image"],
+                    workdir=md["workdir"],
+                    eval_cmd=md["eval_cmd"],
+                    diff_text=bundle.final_diff() if bundle else "",
+                    timeout_sec=eval_timeout,
+                    metadata={**(sample.metadata or {}), **md},
+                )
+                eval_elapsed = time.time() - t_eval
+        except asyncio.TimeoutError as exc:
+            raise HybridPipelineTimeoutError(
+                stage="stage1",
+                phase="eval_pipeline",
+                instance_id=instance_id,
+                guard_sec=guard,
+                elapsed_sec=time.time() - t0,
+                detail=f"agent_elapsed_sec={agent_elapsed:.1f}",
+            ) from exc
         eval_queue_wait = float(eval_result.details.get("eval_queue_wait_sec") or 0.0)
         reward_path = getattr(
             args,
@@ -498,105 +544,134 @@ async def live_branch_runner(
             queue_wait = time.time() - t_queue
             pipeline_deadline = asyncio.get_running_loop().time() + guard
             t_agent = time.time()
-            async with asyncio.timeout_at(pipeline_deadline):
-                exact_ready, exact_error = bundle.token_exact_readiness(branch_step_t)
-                if not exact_ready:
-                    raise RuntimeError(f"token_exact_bundle_not_ready:{exact_error}")
-                snapshot_ids = [str(step.tool_use_id or "") for step in bundle.steps]
-                if edit_step_i < 0 or edit_step_i >= len(snapshot_ids):
-                    raise IndexError(f"edit_step_i out of range: {edit_step_i}")
-                target_tool_use_id = snapshot_ids[edit_step_i]
-                checkpoint = bundle.checkpoint_for_tool_use_id(target_tool_use_id)
-                if checkpoint is None:
-                    raise RuntimeError(f"missing_prompt_checkpoint_for_tool:{target_tool_use_id}")
-                checkpoint_tool_ids = [
-                    str(value) for value in checkpoint.get("generated_tool_use_ids") or []
-                ]
-                if target_tool_use_id not in checkpoint_tool_ids:
-                    raise RuntimeError(
-                        f"checkpoint_does_not_generate_target_tool:{target_tool_use_id}"
+            try:
+                async with asyncio.timeout_at(pipeline_deadline):
+                    exact_ready, exact_error = bundle.token_exact_readiness(branch_step_t)
+                    if not exact_ready:
+                        raise RuntimeError(f"token_exact_bundle_not_ready:{exact_error}")
+                    snapshot_ids = [str(step.tool_use_id or "") for step in bundle.steps]
+                    if edit_step_i < 0 or edit_step_i >= len(snapshot_ids):
+                        raise IndexError(f"edit_step_i out of range: {edit_step_i}")
+                    target_tool_use_id = snapshot_ids[edit_step_i]
+                    checkpoint = bundle.checkpoint_for_tool_use_id(target_tool_use_id)
+                    if checkpoint is None:
+                        raise RuntimeError(
+                            f"missing_prompt_checkpoint_for_tool:{target_tool_use_id}"
+                        )
+                    checkpoint_tool_ids = [
+                        str(value) for value in checkpoint.get("generated_tool_use_ids") or []
+                    ]
+                    if target_tool_use_id not in checkpoint_tool_ids:
+                        raise RuntimeError(
+                            f"checkpoint_does_not_generate_target_tool:{target_tool_use_id}"
+                        )
+                    native_prefix = truncate_native_session_before_tools(
+                        bundle.native_session(),
+                        checkpoint_tool_ids,
                     )
-                native_prefix = truncate_native_session_before_tools(
-                    bundle.native_session(),
-                    checkpoint_tool_ids,
-                )
-                await state.adapter.open_session_async(
-                    session_id,
-                    sampling_defaults=dict(sampling_params or {}),
-                    max_context_tokens=state.max_context_len,
-                    resume_checkpoint=checkpoint,
-                )
-
-                async with _workspace_after_submit(bundle, branch_step_t) as (sb, applied):
-                    if not applied:
-                        raise RuntimeError(f"rebuild apply/verify failed t={branch_step_t}")
-
-                    claude_env = gen._build_claude_env(
-                        adapter_url=state.adapter_url, session_id=session_id
-                    )
-                    await agent_runtime.install_toolchain(sb)
-                    await agent_runtime.ensure_claude_home_writable(sb)
-                    await install_snapshot_hook(sb, workdir)
-                    agent_result = await agent_runtime.run_claude_native_resume(
-                        sb,
-                        workdir=workdir,
-                        env=claude_env,
-                        time_budget_sec=branch_budget,
-                        session_jsonl=native_prefix.jsonl,
-                    )
-                    # Persist the wire transcript before validating resume status.
-                    # Protocol failures are exactly the cases where this artifact
-                    # is most useful; previously it was written only for survivors.
-                    atomic_write_text(
-                        os.path.join(bundle.dir, branch_transcript_rel),
-                        str(agent_result.get("trajectory_jsonl") or ""),
+                    await state.adapter.open_session_async(
+                        session_id,
+                        sampling_defaults=dict(sampling_params or {}),
+                        max_context_tokens=state.max_context_len,
+                        resume_checkpoint=checkpoint,
                     )
 
-                    cont_diff = await _common.workspace_diff(sb, workdir)
-                    if not (cont_diff or "").strip():
-                        cont_diff = await agent_runtime.git_diff(sb, workdir=workdir)
+                    async with _workspace_after_submit(bundle, branch_step_t) as (sb, applied):
+                        if not applied:
+                            raise RuntimeError(f"rebuild apply/verify failed t={branch_step_t}")
 
-                resume_status = state.adapter.resume_status(session_id)
-                if (
-                    resume_status.get("mode") != "token_exact"
-                    or not resume_status.get("handshake_validated")
-                    or not resume_status.get("first_prompt_exact")
-                    or int(resume_status.get("exact_request_count") or 0) <= 0
-                    or resume_status.get("error")
-                ):
-                    raise RuntimeError(f"token_exact_resume_not_verified:{resume_status}")
-                segments = await state.adapter.finish_session(session_id)
-                if not segments:
-                    logger.warning(
-                        "[hybrid-live] Stage-2 skipped: native token-exact resume produced no new "
-                        "adapter segments instance=%s trial=%d edit=%d branch=%d bundle=%s exit=%s",
-                        instance_id,
-                        source_trial_idx,
-                        edit_step_i,
-                        branch_idx,
-                        bundle.dir,
-                        agent_result.get("exit_code"),
-                    )
-                    raise RuntimeError("token_exact_resume_no_new_adapter_segments")
-                native_target_row_index = native_prefix.target_row_index
-                del checkpoint, native_prefix
+                        claude_env = gen._build_claude_env(
+                            adapter_url=state.adapter_url, session_id=session_id
+                        )
+                        await agent_runtime.install_toolchain(sb)
+                        await agent_runtime.ensure_claude_home_writable(sb)
+                        await install_snapshot_hook(sb, workdir)
+                        agent_result = await agent_runtime.run_claude_native_resume(
+                            sb,
+                            workdir=workdir,
+                            env=claude_env,
+                            time_budget_sec=branch_budget,
+                            session_jsonl=native_prefix.jsonl,
+                        )
+                        # Persist the wire transcript before validating resume status.
+                        # Protocol failures are exactly the cases where this artifact
+                        # is most useful; previously it was written only for survivors.
+                        atomic_write_text(
+                            os.path.join(bundle.dir, branch_transcript_rel),
+                            str(agent_result.get("trajectory_jsonl") or ""),
+                        )
+
+                        cont_diff = await _common.workspace_diff(sb, workdir)
+                        if not (cont_diff or "").strip():
+                            cont_diff = await agent_runtime.git_diff(sb, workdir=workdir)
+
+                    resume_status = state.adapter.resume_status(session_id)
+                    if (
+                        resume_status.get("mode") != "token_exact"
+                        or not resume_status.get("handshake_validated")
+                        or not resume_status.get("first_prompt_exact")
+                        or int(resume_status.get("exact_request_count") or 0) <= 0
+                        or resume_status.get("error")
+                    ):
+                        raise RuntimeError(f"token_exact_resume_not_verified:{resume_status}")
+                    segments = await state.adapter.finish_session(session_id)
+                    if not segments:
+                        logger.warning(
+                            "[hybrid-live] Stage-2 skipped: native token-exact resume produced "
+                            "no new adapter segments instance=%s trial=%d edit=%d branch=%d "
+                            "bundle=%s exit=%s",
+                            instance_id,
+                            source_trial_idx,
+                            edit_step_i,
+                            branch_idx,
+                            bundle.dir,
+                            agent_result.get("exit_code"),
+                        )
+                        raise RuntimeError("token_exact_resume_no_new_adapter_segments")
+                    native_target_row_index = native_prefix.target_row_index
+                    del checkpoint, native_prefix
+            except asyncio.TimeoutError as exc:
+                raise HybridPipelineTimeoutError(
+                    stage="stage2",
+                    phase="agent_pipeline",
+                    instance_id=instance_id,
+                    guard_sec=guard,
+                    elapsed_sec=time.time() - t_agent,
+                    detail=(
+                        f"trial={source_trial_idx} edit={edit_step_i} "
+                        f"branch={branch_idx} branch_step_t={branch_step_t}"
+                    ),
+                ) from exc
             agent_elapsed = time.time() - t_agent
 
         # Release the agent slot, but keep the same absolute deadline while
         # queueing for an eval slot and running the clean-sandbox evaluator.
-        async with asyncio.timeout_at(pipeline_deadline):
-            t_eval = time.time()
-            eval_result = await gen._evaluate_diff(
-                image=image,
-                workdir=workdir,
-                eval_cmd=str(md.get("eval_cmd") or ""),
-                diff_text=cont_diff or "",
-                timeout_sec=eval_timeout,
-                # Prefer sample.metadata grading fields; bundle.task_metadata
-                # may be incomplete on older bundles.
-                metadata={**(sample.metadata or {}), **md},
-            )
-            eval_elapsed = time.time() - t_eval
+        try:
+            async with asyncio.timeout_at(pipeline_deadline):
+                t_eval = time.time()
+                eval_result = await gen._evaluate_diff(
+                    image=image,
+                    workdir=workdir,
+                    eval_cmd=str(md.get("eval_cmd") or ""),
+                    diff_text=cont_diff or "",
+                    timeout_sec=eval_timeout,
+                    # Prefer sample.metadata grading fields; bundle.task_metadata
+                    # may be incomplete on older bundles.
+                    metadata={**(sample.metadata or {}), **md},
+                )
+                eval_elapsed = time.time() - t_eval
+        except asyncio.TimeoutError as exc:
+            raise HybridPipelineTimeoutError(
+                stage="stage2",
+                phase="eval_pipeline",
+                instance_id=instance_id,
+                guard_sec=guard,
+                elapsed_sec=time.time() - t0,
+                detail=(
+                    f"trial={source_trial_idx} edit={edit_step_i} branch={branch_idx} "
+                    f"agent_elapsed_sec={agent_elapsed:.1f}"
+                ),
+            ) from exc
         eval_queue_wait = float(eval_result.details.get("eval_queue_wait_sec") or 0.0)
         reward_path = getattr(
             args,

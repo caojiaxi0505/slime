@@ -39,7 +39,8 @@ from slime.utils.types import Sample
         ),
         (RuntimeError("token_exact_resume_not_verified"), "resume_other"),
         (RuntimeError("rebuild apply/verify failed"), "workspace_rebuild"),
-        (TimeoutError(), "timeout"),
+        (TimeoutError(), "timeout_other"),
+        (asyncio.CancelledError(), "cancelled"),
         (RuntimeError("boom"), "other"),
     ],
 )
@@ -337,6 +338,39 @@ def test_hybrid_partial_trial_failure_keeps_grpo_slot(tmp_path):
     assert all(s.metadata["hybrid_num_stage1_aborted_placeholders"] == 1 for s in out)
 
 
+def test_hybrid_cancelled_trial_keeps_grpo_slot(tmp_path):
+    os.environ["STEP_GRPO_HYBRID_K"] = "2"
+    bundle = _bundle(tmp_path, ["", "diff --git a/a b/a\n+1\n"])
+
+    async def vanilla_runner(**kwargs):
+        i = kwargs["trial_idx"]
+        if i == 0:
+            raise asyncio.CancelledError()
+        return bundle, [_sample(1.0, index=i)], True, [[], [-1.0]]
+
+    out = asyncio.run(
+        hybrid_generate(
+            SimpleNamespace(),
+            _sample(index=7),
+            {},
+            vanilla_runner=vanilla_runner,
+            branch_runner=AsyncMock(),
+        )
+    )
+
+    assert len(out) == 2
+    by_trial = {s.metadata["trial_idx"]: s for s in out}
+    aborted = by_trial[0]
+    assert aborted.status == Sample.Status.ABORTED
+    assert aborted.remove_sample is True
+    assert aborted.reward == 0.0
+    assert aborted.loss_mask == [0]
+    assert aborted.metadata["abort_reason"] == "vanilla_trial_exception:CancelledError"
+    assert aborted.metadata["branch_uid"] == "v:0:t0"
+    assert all(s.metadata["hybrid_num_stage1_aborted_placeholders"] == 1 for s in out)
+    assert all(s.metadata["hybrid_num_stage1_cancelled_placeholders"] == 1 for s in out)
+
+
 def test_hybrid_all_trials_fail_returns_all_abort_slots():
     os.environ["STEP_GRPO_HYBRID_K"] = "2"
 
@@ -363,6 +397,53 @@ def test_hybrid_all_trials_fail_returns_all_abort_slots():
     assert all(s.metadata["abort_reason"] == "vanilla_trial_exception:RuntimeError" for s in out)
     assert all(s.metadata["stage1_group_size"] == 2 for s in out)
     assert all(s.metadata["hybrid_num_stage1_aborted_placeholders"] == 2 for s in out)
+
+
+def test_hybrid_cancelled_branch_is_dropped(tmp_path):
+    os.environ["STEP_GRPO_HYBRID_K"] = "2"
+    b0 = _bundle(tmp_path / "a", ["", "diff --git a/a b/a\n+1\n"])
+    b1 = _bundle(tmp_path / "b", ["", "diff --git a/a b/a\n+2\n"])
+
+    async def vanilla_runner(**kwargs):
+        i = kwargs["trial_idx"]
+        bundle = b0 if i == 0 else b1
+        lps = [[], [-1.0]] if i == 0 else [[], [-5.0]]
+        return bundle, [_sample(0.0, index=i)], False, lps
+
+    calls = []
+
+    async def branch_runner(**kwargs):
+        calls.append(kwargs["branch_idx"])
+        if len(calls) == 1:
+            raise asyncio.CancelledError()
+        s = _sample(0.0, index=100 + len(calls))
+        s.metadata = {
+            "sample_kind": "branch",
+            "step_group_key": f"0:{kwargs['source_trial_idx']}:edit:{kwargs['edit_step_i']}",
+            "source_trial_idx": kwargs["source_trial_idx"],
+            "edit_step_i": kwargs["edit_step_i"],
+            "branch_step_t": kwargs["branch_step_t"],
+            "branch_idx": kwargs["branch_idx"],
+            "edit_ppl": kwargs["edit_ppl"],
+        }
+        s.loss_mask = [1]
+        return [s]
+
+    out = asyncio.run(
+        hybrid_generate(
+            SimpleNamespace(),
+            _sample(),
+            {},
+            vanilla_runner=vanilla_runner,
+            branch_runner=branch_runner,
+        )
+    )
+
+    branches = [s for s in out if s.metadata["sample_kind"] == "branch"]
+    assert len(calls) == 4
+    assert len(branches) == 3
+    assert all(s.metadata["hybrid_num_dropped_branches"] == 1 for s in out)
+    assert all(s.metadata["hybrid_num_dropped_cancelled"] == 1 for s in out)
 
 
 def test_hybrid_step_turn_mismatch_raises():

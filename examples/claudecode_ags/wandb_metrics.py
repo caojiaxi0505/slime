@@ -584,6 +584,7 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
     for metadata_key, metric_leaf in (
         ("hybrid_num_stage1_planned_trials", "n_stage1_planned_trials"),
         ("hybrid_num_stage1_aborted_placeholders", "n_stage1_aborted_placeholders"),
+        ("hybrid_num_stage1_cancelled_placeholders", "n_stage1_cancelled_placeholders"),
         ("hybrid_num_patch_candidates", "n_patch_candidates"),
         ("hybrid_num_selected_edits", "n_selected_edits"),
         ("hybrid_num_branch_tasks", "n_branch_tasks"),
@@ -601,6 +602,10 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
         ),
         ("hybrid_num_dropped_branches", "n_dropped_branches"),
         ("hybrid_num_dropped_timeout", "n_dropped_timeout"),
+        ("hybrid_num_dropped_timeout_agent_pipeline", "n_dropped_timeout_agent_pipeline"),
+        ("hybrid_num_dropped_timeout_eval_pipeline", "n_dropped_timeout_eval_pipeline"),
+        ("hybrid_num_dropped_timeout_other", "n_dropped_timeout_other"),
+        ("hybrid_num_dropped_cancelled", "n_dropped_cancelled"),
         ("hybrid_num_dropped_resume_tool_echo", "n_dropped_resume_tool_echo"),
         ("hybrid_num_dropped_resume_missing_result", "n_dropped_resume_missing_result"),
         ("hybrid_num_dropped_resume_no_pending", "n_dropped_resume_no_pending"),
@@ -634,6 +639,11 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
     aborted_stage1 = out.get("perf/step_grpo/n_stage1_aborted_placeholders")
     if planned_stage1 is not None and planned_stage1 > 0 and aborted_stage1 is not None:
         out["perf/step_grpo/stage1_aborted_placeholder_rate"] = aborted_stage1 / planned_stage1
+    cancelled_stage1 = out.get("perf/step_grpo/n_stage1_cancelled_placeholders")
+    if planned_stage1 is not None and planned_stage1 > 0 and cancelled_stage1 is not None:
+        out["perf/step_grpo/stage1_cancelled_placeholder_rate"] = (
+            cancelled_stage1 / planned_stage1
+        )
     planned = out.get("perf/step_grpo/n_branch_tasks")
     dropped = out.get("perf/step_grpo/n_dropped_branches")
     if planned is not None and planned > 0 and dropped is not None:

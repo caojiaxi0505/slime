@@ -340,6 +340,10 @@ class AGSSandbox:
         """Call AGS ``/execute`` with one request ID across all retry attempts."""
         runtime = self._deployment.runtime
         request_id = str(uuid.uuid4())
+        try:
+            request_timeout_sec = max(1.0, float(getattr(command, "timeout", 120)) + 60.0)
+        except (TypeError, ValueError):
+            request_timeout_sec = 180.0
 
         async def request_once() -> Any:
             ensure_token = getattr(runtime, "_ensure_valid_token", None)
@@ -347,7 +351,10 @@ class AGSSandbox:
                 await ensure_token()
             headers = dict(runtime._headers)
             headers["X-Request-ID"] = request_id
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=True)) as session:
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(force_close=True),
+                timeout=aiohttp.ClientTimeout(total=request_timeout_sec),
+            ) as session:
                 async with session.post(
                     f"{runtime._api_url}/execute",
                     json=command.model_dump(),

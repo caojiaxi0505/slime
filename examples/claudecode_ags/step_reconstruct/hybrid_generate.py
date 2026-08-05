@@ -36,9 +36,18 @@ BranchRunner = Callable[..., Awaitable[list[Sample]]]
 
 def _branch_drop_bucket(error: BaseException) -> str:
     """Classify one failed branch into one stable, low-cardinality bucket."""
+    explicit = getattr(error, "bucket", None)
+    if explicit:
+        return str(explicit)
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
     message = str(error).lower()
+    if "pipeline_timeout:stage2:agent_pipeline" in message:
+        return "timeout_agent_pipeline"
+    if "pipeline_timeout:stage2:eval_pipeline" in message:
+        return "timeout_eval_pipeline"
     if isinstance(error, TimeoutError) or "timeout" in message or "timed out" in message:
-        return "timeout"
+        return "timeout_other"
     if "expected one echo for tool_use" in message or "expected at most one echo" in message:
         return "resume_tool_echo"
     if "expected one result for tool_use" in message:
@@ -58,6 +67,21 @@ def _branch_drop_bucket(error: BaseException) -> str:
     if "rebuild" in message or "workspace" in message:
         return "workspace_rebuild"
     return "other"
+
+
+def _vanilla_exception_reason(error: BaseException) -> str:
+    """Low-cardinality reason for Stage-1 aborted placeholders."""
+    explicit = getattr(error, "bucket", None)
+    if explicit:
+        return f"vanilla_trial_exception:{explicit}"
+    if isinstance(error, asyncio.CancelledError):
+        return "vanilla_trial_exception:CancelledError"
+    message = str(error).lower()
+    if "pipeline_timeout:stage1:agent_pipeline" in message:
+        return "vanilla_trial_exception:timeout_agent_pipeline"
+    if "pipeline_timeout:stage1:eval_pipeline" in message:
+        return "vanilla_trial_exception:timeout_eval_pipeline"
+    return f"vanilla_trial_exception:{type(error).__name__}"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -439,6 +463,7 @@ async def hybrid_generate(
     hybrid_stats = {
         "hybrid_num_stage1_planned_trials": k,
         "hybrid_num_stage1_aborted_placeholders": 0,
+        "hybrid_num_stage1_cancelled_placeholders": 0,
         "hybrid_num_patch_candidates": 0,
         "hybrid_num_selected_edits": 0,
         "hybrid_num_branch_tasks": 0,
@@ -451,6 +476,10 @@ async def hybrid_generate(
         "hybrid_stage2_max_loss_tokens": 0,
         "hybrid_num_dropped_branches": 0,
         "hybrid_num_dropped_timeout": 0,
+        "hybrid_num_dropped_timeout_agent_pipeline": 0,
+        "hybrid_num_dropped_timeout_eval_pipeline": 0,
+        "hybrid_num_dropped_timeout_other": 0,
+        "hybrid_num_dropped_cancelled": 0,
         "hybrid_num_dropped_resume_tool_echo": 0,
         "hybrid_num_dropped_resume_missing_result": 0,
         "hybrid_num_dropped_resume_no_pending": 0,
@@ -467,8 +496,27 @@ async def hybrid_generate(
         if isinstance(res, StepTurnAlignmentError):
             # Strict: never silently degrade to vanilla-only on alignment bugs.
             raise res
+        if isinstance(res, asyncio.CancelledError):
+            reason = _vanilla_exception_reason(res)
+            logger.warning(
+                "[hybrid] vanilla trial=%d cancelled; replaced by aborted placeholder",
+                i,
+            )
+            vanilla_samples.append(
+                _aborted_vanilla_trial(
+                    sample,
+                    trial_idx=i,
+                    base_index=base_index,
+                    group_index=group_index,
+                    stage1_group_size=k,
+                    reason=reason,
+                )
+            )
+            hybrid_stats["hybrid_num_stage1_aborted_placeholders"] += 1
+            hybrid_stats["hybrid_num_stage1_cancelled_placeholders"] += 1
+            continue
         if isinstance(res, Exception):
-            reason = f"vanilla_trial_exception:{type(res).__name__}"
+            reason = _vanilla_exception_reason(res)
             logger.warning(
                 "[hybrid] vanilla trial=%d replaced by aborted placeholder: %s",
                 i,
@@ -486,6 +534,8 @@ async def hybrid_generate(
             )
             hybrid_stats["hybrid_num_stage1_aborted_placeholders"] += 1
             continue
+        if isinstance(res, BaseException):
+            raise res
         bundle, samples, is_solved, turn_lps = res
         if not samples:
             logger.warning(
@@ -579,12 +629,30 @@ async def hybrid_generate(
     stage2_wall = time.time() - t_stage2
     branch_samples: list[Sample] = []
     for res in branch_raw:
+        if isinstance(res, asyncio.CancelledError):
+            bucket = _branch_drop_bucket(res)
+            logger.warning("[hybrid] dropped branch bucket=%s: %s", bucket, res)
+            hybrid_stats["hybrid_num_dropped_branches"] += 1
+            stat_key = f"hybrid_num_dropped_{bucket}"
+            if stat_key in hybrid_stats:
+                hybrid_stats[stat_key] += 1
+            else:
+                hybrid_stats["hybrid_num_dropped_other"] += 1
+            continue
         if isinstance(res, Exception):
             bucket = _branch_drop_bucket(res)
             logger.warning("[hybrid] dropped branch bucket=%s: %s", bucket, res)
             hybrid_stats["hybrid_num_dropped_branches"] += 1
-            hybrid_stats[f"hybrid_num_dropped_{bucket}"] += 1
+            if bucket.startswith("timeout_"):
+                hybrid_stats["hybrid_num_dropped_timeout"] += 1
+            stat_key = f"hybrid_num_dropped_{bucket}"
+            if stat_key in hybrid_stats:
+                hybrid_stats[stat_key] += 1
+            else:
+                hybrid_stats["hybrid_num_dropped_other"] += 1
             continue
+        if isinstance(res, BaseException):
+            raise res
         for s in res:
             s.metadata = s.metadata or {}
             s.metadata.setdefault("sample_kind", "branch")

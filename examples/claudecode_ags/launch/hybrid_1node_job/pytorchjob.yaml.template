@@ -197,6 +197,8 @@ spec:
                   value: "cc-prefix-2.1.104-linux-x64.tar.gz"
                 - name: SLIME_CC_TIME_BUDGET_SEC
                   value: "${SLIME_CC_TIME_BUDGET_SEC}"
+                - name: SLIME_CC_GENERATE_GUARD_SEC
+                  value: "${SLIME_CC_GENERATE_GUARD_SEC}"
                 - name: SLIME_CC_EVAL_TIMEOUT_SEC
                   value: "600"
                 - name: STEP_GRPO_BRANCH_BUDGET_SEC
@@ -205,6 +207,14 @@ spec:
                   value: "${SLIME_CC_AGENT_CONCURRENCY}"
                 - name: SLIME_CC_EVAL_CONCURRENCY
                   value: "${SLIME_CC_EVAL_CONCURRENCY}"
+                - name: SLIME_CC_EVAL_CONTROL_CONCURRENCY
+                  value: "${SLIME_CC_EVAL_CONTROL_CONCURRENCY}"
+                - name: SLIME_CC_EVAL_POLL_INTERVAL_SEC
+                  value: "${SLIME_CC_EVAL_POLL_INTERVAL_SEC}"
+                - name: SLIME_CC_EVAL_POLL_JITTER_SEC
+                  value: "${SLIME_CC_EVAL_POLL_JITTER_SEC}"
+                - name: SLIME_CC_EVAL_COMPLETION_GRACE_SEC
+                  value: "${SLIME_CC_EVAL_COMPLETION_GRACE_SEC}"
                 - name: SLIME_CC_TOOL_LOOP_PENALTY
                   value: "${SLIME_CC_TOOL_LOOP_PENALTY}"
                 - name: SLIME_CC_TIMEOUT_OUTCOME_REWARD
