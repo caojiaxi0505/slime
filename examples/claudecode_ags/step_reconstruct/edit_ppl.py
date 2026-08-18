@@ -76,18 +76,21 @@ def align_logprobs_to_steps(
     return aligned
 
 
-def iter_patch_turn_ppls(
+def iter_turn_ppls(
     step_diffs: Sequence[str],
     turn_logprobs: Sequence[Sequence[float]],
     *,
     clip: float = 20.0,
+    patch_only: bool = True,
 ) -> list[PatchTurnPPL]:
-    """Return edit-PPL for each step whose cumulative workspace diff changed.
+    """Return per-step PPL, restricted to patch turns when ``patch_only``.
 
     Aligns ``turn_logprobs[i]`` with ``step_diffs[i]`` (i-th tool snapshot).
     A patch turn is an index ``i`` where
     ``normalize_diff(step_diffs[i]) != normalize_diff(step_diffs[i-1])``
-    (for ``i==0``, any non-empty diff counts).
+    (for ``i==0``, any non-empty diff counts). With ``patch_only=False`` every
+    tool turn is returned, which teacher relabeling uses to cover read/search
+    turns as well.
 
     Raises :class:`StepTurnAlignmentError` on length mismatch (callers must
     not silently skip Stage-2).
@@ -110,7 +113,7 @@ def iter_patch_turn_ppls(
     prev = ""
     for i, diff in enumerate(step_diffs):
         cur = normalize_diff(diff)
-        if cur == prev:
+        if patch_only and cur == prev:
             continue
         lps = turn_logprobs[i] or []
         if not lps:

@@ -136,14 +136,23 @@ export STEP_GRPO_FILTER="${STEP_GRPO_FILTER:-1}"
 export STEP_GRPO_STAGE1_LOSS_WEIGHT="${STEP_GRPO_STAGE1_LOSS_WEIGHT:-1.0}"
 export STEP_GRPO_BRANCH_LOSS_WEIGHT="${STEP_GRPO_BRANCH_LOSS_WEIGHT:-1.0}"
 export STEP_GRPO_STAGE2_LOSS_SCOPE="${STEP_GRPO_STAGE2_LOSS_SCOPE:-full_continuation}"
+# Turn-level teacher SFT. Empty keeps Path A hybrid generate/loss.
+export STEP_GRPO_TEACHER_SFT_MODE="${STEP_GRPO_TEACHER_SFT_MODE:-}"
+export STEP_GRPO_TEACHER_MAX_STEPS="${STEP_GRPO_TEACHER_MAX_STEPS:-2}"
+export STEP_GRPO_TEACHER_TURN_SELECT="${STEP_GRPO_TEACHER_TURN_SELECT:-all}"
+export STEP_GRPO_TEACHER_TURN_MAX_PER_TRIAL="${STEP_GRPO_TEACHER_TURN_MAX_PER_TRIAL:-0}"
+export SLIME_REMOTE_OPENAI_MAX_INFLIGHT="${SLIME_REMOTE_OPENAI_MAX_INFLIGHT:-32}"
+export SLIME_REMOTE_OPENAI_KEEPALIVE_SEC="${SLIME_REMOTE_OPENAI_KEEPALIVE_SEC:-60}"
+export SLIME_REMOTE_OPENAI_KEEPALIVE_MAX_TOKENS="${SLIME_REMOTE_OPENAI_KEEPALIVE_MAX_TOKENS:-1}"
+export SLIME_REMOTE_OPENAI_KEEPALIVE_INFLIGHT="${SLIME_REMOTE_OPENAI_KEEPALIVE_INFLIGHT:-4}"
 
 if [[ "${PHASE}" == "eval" ]]; then
   # train.py: if num_rollout == 0 and eval_interval is set → eval-only.
   NUM_ROLLOUT="${NUM_ROLLOUT:-0}"
   EVAL_INTERVAL="${EVAL_INTERVAL:-1}"
 else
-  # One pass over 1394 prompts @ rollout_batch=16 → ceil(1394/16)=88.
-  # With RBS=8 default: ceil(1394/8)=175; override NUM_ROLLOUT if you change RBS.
+  # The default training file has 338 prompts. At the formal RBS=16 barrier,
+  # one pass is about 22 updates; NUM_ROLLOUT=88 is therefore about 4 passes.
   NUM_ROLLOUT="${NUM_ROLLOUT:-88}"
   EVAL_INTERVAL="${EVAL_INTERVAL:-${NUM_ROLLOUT}}"
 fi
@@ -154,11 +163,24 @@ if [[ "${GLOBAL_BATCH_SIZE}" -ne "${_expected_gbs}" ]]; then
   echo "ERROR: GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must equal ROLLOUT_BATCH_SIZE*N_SAMPLES=${_expected_gbs}" >&2
   exit 2
 fi
+if [[ "${STEP_GRPO_TEACHER_SFT_MODE}" == "sft_only" ]] && \
+   { [[ "${ROLLOUT_BATCH_SIZE}" -ne 16 ]] || [[ "${GLOBAL_BATCH_SIZE}" -ne 16 ]] || \
+     [[ "${STEP_GRPO_HYBRID_K}" -ne 8 ]]; }; then
+  echo "ERROR: sft_only requires 16 raw tasks × 8 student trials (RBS=GBS=16, K=8)" >&2
+  echo "       got RBS=${ROLLOUT_BATCH_SIZE} GBS=${GLOBAL_BATCH_SIZE} K=${STEP_GRPO_HYBRID_K}" >&2
+  exit 2
+fi
 
 # Fresh default tag — do NOT reuse qwen35_9b_cc_ags_1node_hybrid (empty-run ckpts).
 EXP_TAG="${EXP_TAG:-qwen35_9b_cc_ags_1node_hybrid_ltpa}"
 LOG_DIR="${LOG_DIR:-/mnt/sn-007/jiaxicao/checkpoints/cc-ags/${EXP_TAG}}"
 RUN_ROOT="${RUN_ROOT:-${LOG_DIR}}"
+export SLIME_AGENT_SFT_LOG_DIR="${SLIME_AGENT_SFT_LOG_DIR:-${RUN_ROOT}/student_sft_turns}"
+export SLIME_TEACHER_SFT_LOG_DIR="${SLIME_TEACHER_SFT_LOG_DIR:-${RUN_ROOT}/teacher_sft_turns}"
+if [[ "${SLIME_AGENT_SFT_LOG_DIR}" == "${SLIME_TEACHER_SFT_LOG_DIR}" ]]; then
+  echo "ERROR: Stage-1 and Teacher SFT log directories must differ" >&2
+  exit 2
+fi
 LOAD_PATH="${LOAD_PATH:-${LOG_DIR}/slime_save}"
 SAVE_PATH="${SAVE_PATH:-${LOG_DIR}/slime_save}"
 LOAD_CKPT_STEP="${LOAD_CKPT_STEP:-}"
@@ -200,7 +222,7 @@ export SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SEC="${SLIME_AGENT_AGS_RUNTIME_TIMEOUT_SE
 export SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC="${SLIME_AGENT_AGS_BOOT_TIMEOUT_SEC:-600}"
 export STEP_GRPO_BRANCH_BUDGET_SEC="${STEP_GRPO_BRANCH_BUDGET_SEC:-${SLIME_CC_TIME_BUDGET_SEC}}"
 # True in-flight agent cap (vanilla + branch); <=0 disables.
-export SLIME_CC_AGENT_CONCURRENCY="${SLIME_CC_AGENT_CONCURRENCY:-64}"
+export SLIME_CC_AGENT_CONCURRENCY="${SLIME_CC_AGENT_CONCURRENCY:-32}"
 
 # ============ asserts ============
 if [[ -z "${SLIME_ADAPTER_PUBLIC_URL:-}" || "${SLIME_ADAPTER_PUBLIC_URL}" == *REPLACE_WITH* ]]; then
@@ -293,6 +315,29 @@ if [[ -n "${LOAD_CKPT_STEP}" ]]; then
   CKPT_ARGS+=(--ckpt-step "${LOAD_CKPT_STEP}")
 fi
 
+GENERATE_FUNCTION_PATH="examples.claudecode_ags.step_reconstruct.hybrid_generate.hybrid_generate"
+TEACHER_SFT_MODE="${STEP_GRPO_TEACHER_SFT_MODE:-}"
+LOSS_ARGS=()
+if [[ -n "${TEACHER_SFT_MODE}" ]]; then
+  GENERATE_FUNCTION_PATH="examples.claudecode_ags.step_reconstruct.hybrid_sft_generate.hybrid_sft_generate"
+  LOSS_ARGS+=(--loss-mask-type qwen3_5)
+  if [[ "${TEACHER_SFT_MODE}" == "sft_only" ]]; then
+    USE_TIS=0
+    LOSS_ARGS+=(
+      --loss-type sft_loss
+      --disable-compute-advantages-and-returns
+    )
+  elif [[ "${TEACHER_SFT_MODE}" == "hybrid" ]]; then
+    LOSS_ARGS+=(
+      --loss-type custom_loss
+      --custom-loss-function-path examples.claudecode_ags.step_reconstruct.hybrid_teacher_sft_loss.hybrid_teacher_sft_loss
+    )
+  else
+    echo "ERROR: STEP_GRPO_TEACHER_SFT_MODE must be sft_only or hybrid, got: ${TEACHER_SFT_MODE}" >&2
+    exit 2
+  fi
+fi
+
 ROLLOUT_ARGS=(
   --prompt-data "${PROMPT_DATA}"
   --input-key prompt
@@ -316,18 +361,29 @@ ROLLOUT_ARGS=(
   --use-dynamic-global-batch-size
   --micro-batch-size 1
   --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
-  --custom-generate-function-path examples.claudecode_ags.step_reconstruct.hybrid_generate.hybrid_generate
+  --custom-generate-function-path "${GENERATE_FUNCTION_PATH}"
   --custom-cc-reward-function-path examples.claudecode_ags.rewards.default.compose
-  --custom-reward-post-process-path examples.claudecode_ags.step_reconstruct.step_grpo_advantage.post_process_rewards
   --custom-rollout-log-function-path examples.claudecode_ags.wandb_metrics.log_rollout_data
 )
 
-# This hook always runs because it assigns the explicit loss objective.
-# STEP_GRPO_FILTER controls only degenerate Stage-2 group removal; Stage-1
-# follows plain GRPO and keeps zero-variance groups.
-ROLLOUT_ARGS+=(
-  --rollout-sample-filter-path examples.claudecode_ags.step_reconstruct.step_grpo_advantage.filter
-)
+if [[ "${TEACHER_SFT_MODE}" != "sft_only" ]]; then
+  ROLLOUT_ARGS+=(
+    --custom-reward-post-process-path examples.claudecode_ags.step_reconstruct.step_grpo_advantage.post_process_rewards
+  )
+fi
+
+# The rollout hook assigns the explicit loss objective after the whole rollout
+# barrier.  SFT-only has a dedicated fixed-task/variable-target normalizer;
+# Hybrid keeps the existing GRPO + branch objective.
+if [[ "${TEACHER_SFT_MODE}" == "sft_only" ]]; then
+  ROLLOUT_ARGS+=(
+    --rollout-sample-filter-path examples.claudecode_ags.step_reconstruct.hybrid_sft_generate.sft_only_filter
+  )
+else
+  ROLLOUT_ARGS+=(
+    --rollout-sample-filter-path examples.claudecode_ags.step_reconstruct.step_grpo_advantage.filter
+  )
+fi
 
 RESUME_DEBUG_ROLLOUT_DATA="${RESUME_DEBUG_ROLLOUT_DATA:-1}"
 if [[ "${RESUME_DEBUG_ROLLOUT_DATA}" = "0" ]]; then
@@ -395,7 +451,7 @@ fi
 
 OPTIMIZER_ARGS=(
   --optimizer adam
-  --lr 3e-6
+  --lr "${LEARNING_RATE:-3e-6}"
   --lr-decay-style constant
   --weight-decay 0.1
   --adam-beta1 0.9
@@ -492,7 +548,12 @@ TRAIN_CMD=(
   "${EVAL_ARGS[@]}"
   "${OPTIMIZER_ARGS[@]}"
   "${WANDB_ARGS[@]}"
-  "${ALGO_ARGS[@]}"
+  "${LOSS_ARGS[@]}"
+)
+if [[ "${TEACHER_SFT_MODE}" != "sft_only" ]]; then
+  TRAIN_CMD+=("${ALGO_ARGS[@]}")
+fi
+TRAIN_CMD+=(
   "${PERF_ARGS[@]}"
   "${SGLANG_ARGS[@]}"
   "${MISC_ARGS[@]}"
@@ -511,10 +572,19 @@ echo "SAVE_INTERVAL=${SAVE_INTERVAL} OPTIMIZER_CPU_OFFLOAD=${OPTIMIZER_CPU_OFFLO
 echo "PROMPT_DATA=${PROMPT_DATA}"
 echo "EVAL_DATA=${EVAL_DATA}"
 echo "SLIME_ADAPTER_PUBLIC_URL=${SLIME_ADAPTER_PUBLIC_URL}"
+echo "TEACHER_SFT_MODE=${TEACHER_SFT_MODE:-off} MAX_STEPS=${STEP_GRPO_TEACHER_MAX_STEPS} SELECT=${STEP_GRPO_TEACHER_TURN_SELECT} MAX_PER_TRIAL=${STEP_GRPO_TEACHER_TURN_MAX_PER_TRIAL}"
+echo "SLIME_TEACHER_ADAPTER_PUBLIC_URL=${SLIME_TEACHER_ADAPTER_PUBLIC_URL:-}"
 echo "======================================================================"
-printf ' %q' "${TRAIN_CMD[@]}"
+PRINT_CMD=("${TRAIN_CMD[@]}")
+for ((i = 1; i < ${#PRINT_CMD[@]}; i++)); do
+  if [[ "${PRINT_CMD[$((i - 1))]}" == "--wandb-key" ]]; then
+    PRINT_CMD[$i]="***"
+  fi
+done
+printf ' %q' "${PRINT_CMD[@]}"
 echo
 echo "======================================================================"
+unset PRINT_CMD
 
 if [[ "${RUN}" != "1" ]]; then
   echo "Dry run only. Set RUN=1 to start Ray head and submit train.py."
@@ -561,13 +631,17 @@ try:
     ).strip()
 except Exception:
     git_commit = "unknown"
+teacher_sft_mode = (os.environ.get("STEP_GRPO_TEACHER_SFT_MODE") or "").strip().lower()
+is_sft_only = teacher_sft_mode == "sft_only"
 manifest = {
-    "schema_version": 2,
+    "schema_version": 3,
     "experiment": exp_tag,
     "git_commit": git_commit,
-    "objective": "mean_prompt(L_v + lambda * L_b)",
-    "stage1_episode_weighting": "fixed_planned_slots_with_zero_mask_placeholders",
-    "stage2_group_weighting": "equal_edit_groups_then_equal_branches_after_filter",
+    "objective": (
+        "mean_active_prompt(mean_relabel(mean_trainable_token_nll))"
+        if is_sft_only
+        else "mean_prompt(L_v + lambda * L_b)"
+    ),
     "stage2_loss_scope": stage2_loss_scope,
     "step_grpo_hybrid_k": int(hybrid_k),
     "step_grpo_filter": filter_enabled not in {"0", "false", "False"},
@@ -582,6 +656,30 @@ manifest = {
     "load_ckpt_step": int(load_ckpt_step) if load_ckpt_step else None,
     "save_path": save_path,
 }
+if is_sft_only:
+    manifest.update(
+        {
+            "teacher_sft_mode": teacher_sft_mode,
+            "teacher_sft_task_barrier": int(rollout_batch_size),
+            "teacher_sft_student_trials_per_task": int(hybrid_k),
+            "teacher_sft_max_steps": int(os.environ.get("STEP_GRPO_TEACHER_MAX_STEPS") or 0),
+            "teacher_sft_turn_select": os.environ.get("STEP_GRPO_TEACHER_TURN_SELECT") or "all",
+            "teacher_sft_turn_max_per_trial": int(
+                os.environ.get("STEP_GRPO_TEACHER_TURN_MAX_PER_TRIAL") or 0
+            ),
+            "teacher_sft_target_count": "variable_after_all_16_tasks_finish",
+            "teacher_sft_pipeline": "teacher_starts_after_each_tasks_8_student_trials",
+            "teacher_sft_weighting": "equal_active_tasks_then_equal_relabels_then_equal_tokens",
+            "teacher_sft_empty_task_handling": "zero_mask_scheduler_placeholder",
+        }
+    )
+else:
+    manifest.update(
+        {
+            "stage1_episode_weighting": "fixed_planned_slots_with_zero_mask_placeholders",
+            "stage2_group_weighting": "equal_edit_groups_then_equal_branches_after_filter",
+        }
+    )
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as f:
     json.dump(manifest, f, indent=2, sort_keys=True)

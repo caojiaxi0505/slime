@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from examples.claudecode_ags.step_reconstruct.edit_ppl import StepTurnAlignmentError, iter_patch_turn_ppls
+from examples.claudecode_ags.step_reconstruct.edit_ppl import StepTurnAlignmentError, iter_turn_ppls
 from examples.claudecode_ags.step_reconstruct.selection import (
     PatchTurnCandidate,
     SelectedTurn,
@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 VanillaRunner = Callable[..., Awaitable[tuple[SessionBundle, list[Sample], bool, list[list[float]]]]]
 BranchRunner = Callable[..., Awaitable[list[Sample]]]
+# Replaces edit-PPL selection plus branching with an alternative Stage-2 that
+# consumes the finished Stage-1 trials directly (teacher turn relabeling).
+Stage2Fn = Callable[..., Awaitable[list[Sample]]]
 
 
 def _branch_drop_bucket(error: BaseException) -> str:
@@ -42,6 +45,8 @@ def _branch_drop_bucket(error: BaseException) -> str:
     if isinstance(error, asyncio.CancelledError):
         return "cancelled"
     message = str(error).lower()
+    if "teacher_context_integrity" in message:
+        return "context_integrity"
     if "pipeline_timeout:stage2:agent_pipeline" in message:
         return "timeout_agent_pipeline"
     if "pipeline_timeout:stage2:eval_pipeline" in message:
@@ -102,7 +107,7 @@ def _shared_rollout_id(sample: Sample) -> int:
     return int(sample.index or 0)
 
 
-def _stage2_train_context_limit(args) -> int:
+def stage2_train_context_limit(args) -> int:
     """Total-token limit for Stage-2 samples before handing them to Megatron."""
     for name in ("rollout_max_context_len", "max_context_len"):
         value = getattr(args, name, None)
@@ -267,8 +272,16 @@ def pre_checkpoint_snapshot_index(
     return positions[0] - 1
 
 
-def collect_patch_candidates(trials: Sequence[VanillaTrialResult]) -> list[PatchTurnCandidate]:
-    """Pool patch turns from all **failed** trials."""
+def collect_patch_candidates(
+    trials: Sequence[VanillaTrialResult],
+    *,
+    patch_only: bool = True,
+) -> list[PatchTurnCandidate]:
+    """Pool resume-able turns from all **failed** trials.
+
+    ``patch_only=False`` keeps every tool turn instead of only the ones that
+    changed the workspace; the resume eligibility checks are identical.
+    """
     clip = _ppl_clip()
     out: list[PatchTurnCandidate] = []
     for tr in trials:
@@ -299,7 +312,7 @@ def collect_patch_candidates(trials: Sequence[VanillaTrialResult]) -> list[Patch
             )
         snapshot_ids = [str(step.tool_use_id or "") for step in tr.bundle.steps]
         diffs = [tr.bundle.step_diff(i) for i in range(tr.bundle.num_steps)]
-        for p in iter_patch_turn_ppls(diffs, tr.turn_logprobs, clip=clip):
+        for p in iter_turn_ppls(diffs, tr.turn_logprobs, clip=clip, patch_only=patch_only):
             target_tool_use_id = snapshot_ids[p.step_t]
             try:
                 checkpoint = tr.bundle.checkpoint_for_tool_use_id(target_tool_use_id)
@@ -415,6 +428,78 @@ def select_branch_turns(trials: Sequence[VanillaTrialResult], k: int) -> list[Se
     return select_top_patch_turns(collect_patch_candidates(trials), k)
 
 
+def collect_stage2_samples(
+    branch_raw: Sequence[Any],
+    *,
+    hybrid_stats: dict[str, Any],
+    sample_kind: str = "branch",
+) -> list[Sample]:
+    """Bucket Stage-2 failures and length-filter the surviving samples.
+
+    Drop buckets outside the counters :func:`hybrid_generate` declares fall into
+    ``dropped_other`` so W&B keeps a fixed key set.
+    """
+
+    def bump(key: str) -> None:
+        hybrid_stats[key] = int(hybrid_stats.get(key) or 0) + 1
+
+    def raise_max(key: str, value: int) -> None:
+        hybrid_stats[key] = max(int(hybrid_stats.get(key) or 0), value)
+
+    out: list[Sample] = []
+    for res in branch_raw:
+        if isinstance(res, asyncio.CancelledError):
+            bucket = _branch_drop_bucket(res)
+            logger.warning("[hybrid] dropped branch bucket=%s: %s", bucket, res)
+            bump("hybrid_num_dropped_branches")
+            stat_key = f"hybrid_num_dropped_{bucket}"
+            bump(stat_key if stat_key in hybrid_stats else "hybrid_num_dropped_other")
+            continue
+        if isinstance(res, Exception):
+            bucket = _branch_drop_bucket(res)
+            logger.warning("[hybrid] dropped branch bucket=%s: %s", bucket, res)
+            bump("hybrid_num_dropped_branches")
+            if bucket.startswith("timeout_"):
+                bump("hybrid_num_dropped_timeout")
+            stat_key = f"hybrid_num_dropped_{bucket}"
+            bump(stat_key if stat_key in hybrid_stats else "hybrid_num_dropped_other")
+            continue
+        if isinstance(res, BaseException):
+            raise res
+        for s in res:
+            s.metadata = s.metadata or {}
+            s.metadata.setdefault("sample_kind", sample_kind)
+            total_tokens = _sample_total_tokens(s)
+            response_tokens = _sample_response_tokens(s)
+            loss_tokens = _sample_loss_tokens(s)
+            bump("hybrid_num_stage2_samples_before_length_filter")
+            raise_max("hybrid_stage2_max_total_tokens", total_tokens)
+            raise_max("hybrid_stage2_max_response_tokens", response_tokens)
+            raise_max("hybrid_stage2_max_loss_tokens", loss_tokens)
+            limit = int(hybrid_stats.get("hybrid_stage2_context_limit_tokens") or 0)
+            if limit > 0 and total_tokens > limit:
+                bump("hybrid_num_stage2_samples_dropped_over_context")
+                logger.warning(
+                    "[hybrid] dropped Stage-2 sample over context limit: "
+                    "total_tokens=%d response_tokens=%d loss_tokens=%d limit=%d "
+                    "instance=%s group=%s branch_uid=%s",
+                    total_tokens,
+                    response_tokens,
+                    loss_tokens,
+                    limit,
+                    s.metadata.get("instance_id"),
+                    getattr(s, "group_index", None),
+                    s.metadata.get("branch_uid"),
+                )
+                continue
+            bump("hybrid_num_stage2_samples_after_length_filter")
+            # Do not rewrite loss_mask: merge_turns already marks every assistant
+            # token in the continuation as trainable (vs first_action), and keeps
+            # tool/context tails at 0 with placeholder rollout_log_probs.
+            out.append(s)
+    return out
+
+
 async def hybrid_generate(
     args,
     sample: Sample,
@@ -423,6 +508,7 @@ async def hybrid_generate(
     *,
     vanilla_runner: VanillaRunner | None = None,
     branch_runner: BranchRunner | None = None,
+    stage2_fn: Stage2Fn | None = None,
 ):
     """Hybrid orchestration. Inject runners for unit tests (no live AGS)."""
     if evaluation:
@@ -434,7 +520,9 @@ async def hybrid_generate(
     group_index = int(sample.group_index) if sample.group_index is not None else int(sample.index or 0)
     base_index = int(sample.index) if sample.index is not None else 0
 
-    if vanilla_runner is None or branch_runner is None:
+    # stage2_fn owns selection and branching, so it needs no branch runner.
+    needs_branch_runner = branch_runner is None and stage2_fn is None
+    if vanilla_runner is None or needs_branch_runner:
         from examples.claudecode_ags.step_reconstruct.live_runners import (
             live_branch_runner,
             live_vanilla_runner,
@@ -442,7 +530,7 @@ async def hybrid_generate(
 
         if vanilla_runner is None:
             vanilla_runner = live_vanilla_runner
-        if branch_runner is None:
+        if needs_branch_runner:
             branch_runner = live_branch_runner
 
     trial_tasks = [
@@ -470,7 +558,7 @@ async def hybrid_generate(
         "hybrid_num_stage2_samples_before_length_filter": 0,
         "hybrid_num_stage2_samples_after_length_filter": 0,
         "hybrid_num_stage2_samples_dropped_over_context": 0,
-        "hybrid_stage2_context_limit_tokens": _stage2_train_context_limit(args),
+        "hybrid_stage2_context_limit_tokens": stage2_train_context_limit(args),
         "hybrid_stage2_max_total_tokens": 0,
         "hybrid_stage2_max_response_tokens": 0,
         "hybrid_stage2_max_loss_tokens": 0,
@@ -487,6 +575,7 @@ async def hybrid_generate(
         "hybrid_num_dropped_resume_subagent": 0,
         "hybrid_num_dropped_resume_other": 0,
         "hybrid_num_dropped_workspace_rebuild": 0,
+        "hybrid_num_dropped_context_integrity": 0,
         "hybrid_num_dropped_other": 0,
     }
 
@@ -572,6 +661,17 @@ async def hybrid_generate(
             )
         )
 
+    # Persist one aggregate per raw task.  Teacher-only training drops the
+    # vanilla rows, so these counters are copied onto teacher rows (or the
+    # zero-loss placeholder) and later deduplicated by rollout_id for W&B.
+    hybrid_stats["hybrid_num_stage1_completed_trials"] = len(trials)
+    hybrid_stats["hybrid_num_stage1_resolved_trials"] = sum(
+        int(trial.is_solved) for trial in trials
+    )
+    hybrid_stats["hybrid_num_stage1_unresolved_trials"] = sum(
+        int(not trial.is_solved) for trial in trials
+    )
+
     def _finish(samples: list[Sample], *, stage2_wall: float = 0.0) -> list[Sample]:
         total = time.time() - t_hybrid0
         samples = _stamp_shared_rollout_id(samples, sample)
@@ -595,6 +695,18 @@ async def hybrid_generate(
 
     if all(t.is_solved for t in trials):
         return _finish(vanilla_samples)
+
+    if stage2_fn is not None:
+        t_stage2 = time.time()
+        stage2_samples = await stage2_fn(
+            args=args,
+            sample=sample,
+            sampling_params=sampling_params,
+            trials=trials,
+            group_index=group_index,
+            hybrid_stats=hybrid_stats,
+        )
+        return _finish(vanilla_samples + stage2_samples, stage2_wall=time.time() - t_stage2)
 
     candidates = collect_patch_candidates(trials)
     selected = select_top_patch_turns(candidates, k)
@@ -627,71 +739,6 @@ async def hybrid_generate(
     t_stage2 = time.time()
     branch_raw = await asyncio.gather(*branch_tasks, return_exceptions=True)
     stage2_wall = time.time() - t_stage2
-    branch_samples: list[Sample] = []
-    for res in branch_raw:
-        if isinstance(res, asyncio.CancelledError):
-            bucket = _branch_drop_bucket(res)
-            logger.warning("[hybrid] dropped branch bucket=%s: %s", bucket, res)
-            hybrid_stats["hybrid_num_dropped_branches"] += 1
-            stat_key = f"hybrid_num_dropped_{bucket}"
-            if stat_key in hybrid_stats:
-                hybrid_stats[stat_key] += 1
-            else:
-                hybrid_stats["hybrid_num_dropped_other"] += 1
-            continue
-        if isinstance(res, Exception):
-            bucket = _branch_drop_bucket(res)
-            logger.warning("[hybrid] dropped branch bucket=%s: %s", bucket, res)
-            hybrid_stats["hybrid_num_dropped_branches"] += 1
-            if bucket.startswith("timeout_"):
-                hybrid_stats["hybrid_num_dropped_timeout"] += 1
-            stat_key = f"hybrid_num_dropped_{bucket}"
-            if stat_key in hybrid_stats:
-                hybrid_stats[stat_key] += 1
-            else:
-                hybrid_stats["hybrid_num_dropped_other"] += 1
-            continue
-        if isinstance(res, BaseException):
-            raise res
-        for s in res:
-            s.metadata = s.metadata or {}
-            s.metadata.setdefault("sample_kind", "branch")
-            total_tokens = _sample_total_tokens(s)
-            response_tokens = _sample_response_tokens(s)
-            loss_tokens = _sample_loss_tokens(s)
-            hybrid_stats["hybrid_num_stage2_samples_before_length_filter"] += 1
-            hybrid_stats["hybrid_stage2_max_total_tokens"] = max(
-                hybrid_stats["hybrid_stage2_max_total_tokens"],
-                total_tokens,
-            )
-            hybrid_stats["hybrid_stage2_max_response_tokens"] = max(
-                hybrid_stats["hybrid_stage2_max_response_tokens"],
-                response_tokens,
-            )
-            hybrid_stats["hybrid_stage2_max_loss_tokens"] = max(
-                hybrid_stats["hybrid_stage2_max_loss_tokens"],
-                loss_tokens,
-            )
-            limit = int(hybrid_stats["hybrid_stage2_context_limit_tokens"])
-            if limit > 0 and total_tokens > limit:
-                hybrid_stats["hybrid_num_stage2_samples_dropped_over_context"] += 1
-                logger.warning(
-                    "[hybrid] dropped Stage-2 sample over context limit: "
-                    "total_tokens=%d response_tokens=%d loss_tokens=%d limit=%d "
-                    "instance=%s group=%s branch_uid=%s",
-                    total_tokens,
-                    response_tokens,
-                    loss_tokens,
-                    limit,
-                    s.metadata.get("instance_id"),
-                    getattr(s, "group_index", None),
-                    s.metadata.get("branch_uid"),
-                )
-                continue
-            hybrid_stats["hybrid_num_stage2_samples_after_length_filter"] += 1
-            # Do not rewrite loss_mask: merge_turns already marks every assistant
-            # token in the continuation as trainable (vs first_action), and keeps
-            # tool/context tails at 0 with placeholder rollout_log_probs.
-            branch_samples.append(s)
+    branch_samples = collect_stage2_samples(branch_raw, hybrid_stats=hybrid_stats)
 
     return _finish(vanilla_samples + branch_samples, stage2_wall=stage2_wall)

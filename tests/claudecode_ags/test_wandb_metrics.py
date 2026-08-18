@@ -308,6 +308,119 @@ def test_outcome_resolved_rate_stage1_only():
     assert tm["perf/stage-2/adapter/request_failure_rate"] == 0.25
 
 
+def test_teacher_sft_rows_are_excluded_from_stage1_metrics():
+    """SFT rows have no reward/eval; they must not land in the Stage-1 curves."""
+    from examples.claudecode_ags.wandb_metrics import _filter_kind, _teacher_sft_metrics
+
+    vanilla = _sample(
+        instance_id="a",
+        group_index=0,
+        index=1,
+        segment_idx=0,
+        num_segments=1,
+        segment_kind="final",
+        reward=1.0,
+        response_length=1,
+        tokens_len=2,
+        grading_solved=True,
+    )
+    vanilla.metadata["sample_kind"] = "vanilla"
+    teacher = _sample(
+        instance_id="a",
+        group_index=0,
+        index=2,
+        segment_idx=0,
+        num_segments=1,
+        segment_kind="final",
+        reward=0.0,
+        response_length=3,
+        tokens_len=20,
+    )
+    teacher.metadata.update(
+        {
+            "sample_kind": "teacher_sft",
+            "branch_uid": "tt:0:t0:c0",
+            "teacher_trainable_tokens": 3,
+            "teacher_prefix_tokens": 17,
+        }
+    )
+
+    samples = [vanilla, teacher]
+    assert _filter_kind(samples, "vanilla") == [vanilla]
+    assert _filter_kind(samples, "branch") == []
+
+    outcome = _reward_source_metrics(samples)
+    assert outcome["outcome/n_episodes"] == 1.0
+    assert outcome["outcome/resolved_rate"] == 1.0
+    assert _trajectory_metrics(samples)["traj/n_samples"] == 1.0
+
+    teacher_metrics = _teacher_sft_metrics([teacher])
+    assert teacher_metrics["perf/step_grpo/n_teacher_sft_samples"] == 1.0
+    assert teacher_metrics["perf/step_grpo/teacher_sft_trainable_tokens_mean"] == 3.0
+    assert teacher_metrics["perf/step_grpo/teacher_sft_prefix_tokens_mean"] == 17.0
+    assert _teacher_sft_metrics([]) == {}
+
+
+def test_teacher_sft_metrics_cover_fixed_16_task_barrier_and_stage1_rate():
+    from examples.claudecode_ags.wandb_metrics import _teacher_sft_metrics
+
+    rows = []
+    for outer in range(16):
+        relabels = 2 if outer == 0 else 4 if outer == 1 else 0
+        task_rows = []
+        for episode in range(max(relabels, 1)):
+            placeholder = relabels == 0
+            row = _sample(
+                instance_id=f"task-{outer}",
+                group_index=outer,
+                index=outer * 100 + episode,
+                segment_idx=0,
+                num_segments=1,
+                segment_kind="final",
+                reward=0.0,
+                response_length=1 if placeholder else 2,
+                tokens_len=2 if placeholder else 10,
+            )
+            row.rollout_id = outer
+            row.loss_group_id = f"teacher:{outer}:{episode}"
+            row.loss_mask = [0] if placeholder else [1, 1]
+            row.remove_sample = placeholder
+            row.loss_weight = 0.0 if placeholder else (4.0 if outer == 0 else 2.0)
+            row.metadata.update(
+                {
+                    "sample_kind": "teacher_sft",
+                    "branch_uid": f"teach:{outer}:{episode}",
+                    "teacher_sft_placeholder": placeholder,
+                    "teacher_trainable_tokens": 0 if placeholder else 2,
+                    "teacher_prefix_tokens": 8,
+                    "hybrid_num_stage1_planned_trials": 8,
+                    "hybrid_num_stage1_completed_trials": 8,
+                    "hybrid_num_stage1_resolved_trials": 3 if outer == 0 else 4 if outer == 1 else 5,
+                    "hybrid_num_stage1_unresolved_trials": 5 if outer == 0 else 4 if outer == 1 else 3,
+                    "hybrid_num_stage1_aborted_placeholders": 0,
+                }
+            )
+            task_rows.append(row)
+        rows.extend(task_rows)
+
+    metrics = _teacher_sft_metrics(rows)
+    assert metrics["perf/step_grpo/n_teacher_sft_samples"] == 6.0
+    assert metrics["perf/step_grpo/n_teacher_sft_rows"] == 20.0
+    assert metrics["perf/step_grpo/n_teacher_sft_placeholders"] == 14.0
+    assert metrics["perf/step_grpo/n_teacher_sft_scheduled_prompts"] == 16.0
+    assert metrics["perf/step_grpo/n_teacher_sft_active_prompts"] == 2.0
+    assert metrics["perf/step_grpo/teacher_sft_relabels_per_prompt/mean"] == 6 / 16
+    assert metrics["perf/step_grpo/teacher_sft_loss_weight_sum"] == 16.0
+    assert metrics["perf/step_grpo/teacher_sft_active_prompt_loss_weight/min"] == 8.0
+    assert metrics["perf/step_grpo/teacher_sft_active_prompt_loss_weight/max"] == 8.0
+    assert metrics["perf/step_grpo/teacher_sft_unset_loss_weight_count"] == 0.0
+    assert metrics["perf/step_grpo/n_stage1_planned_trials"] == 128.0
+    assert metrics["perf/step_grpo/n_stage1_completed_trials"] == 128.0
+    assert metrics["outcome/n_episodes"] == 128.0
+    assert metrics["outcome/resolved_count"] == 77.0
+    assert metrics["outcome/resolved_rate"] == 77 / 128
+
+
 def test_branch_uid_prevents_cross_edit_episode_collision(monkeypatch):
     """Same legacy index at two edit points must remain two W&B episodes."""
     branches = []
@@ -385,6 +498,7 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
             "hybrid_num_dropped_resume_subagent": 0,
             "hybrid_num_dropped_resume_other": 0,
             "hybrid_num_dropped_workspace_rebuild": 0,
+            "hybrid_num_dropped_context_integrity": 1,
             "hybrid_num_dropped_other": 0,
         }
     )
@@ -467,6 +581,7 @@ def test_hybrid_objective_and_queue_metrics(monkeypatch):
     assert m["perf/step_grpo/n_dropped_cancelled"] == 1.0
     assert m["perf/step_grpo/n_dropped_resume_tool_echo"] == 1.0
     assert m["perf/step_grpo/n_dropped_resume_no_pending"] == 1.0
+    assert m["perf/step_grpo/n_dropped_context_integrity"] == 1.0
     assert m["resume/prompt_exact_rate"] == 1.0
     assert m["resume/checkpoint_hash_consistency_rate"] == 1.0
     assert m["resume/tool_use_echo_mismatch_count"] == 2.0

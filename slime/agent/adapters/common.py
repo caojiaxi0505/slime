@@ -119,6 +119,41 @@ def tool_call_dict(name: str, arguments: dict | None) -> dict:
     return {"type": "function", "function": {"name": name, "arguments": arguments or {}}}
 
 
+def check_turn_cap(
+    counts: dict[str, int],
+    sid: str,
+    cap: int | None,
+    *,
+    logger: logging.Logger,
+    log_prefix: str,
+    increment: bool = True,
+) -> web.Response | None:
+    """Enforce a per-sid model-turn cap, counting turns in ``counts``.
+
+    Returns the 429 Claude Code treats as fatal once the cap is reached, which
+    is how callers stop a harness run after a fixed number of model turns.
+    ``increment=False`` only peeks (teacher adapter counts successful turns
+    later, so a remote 429 does not burn a step).
+    """
+    if cap is None:
+        return None
+    prior = counts.get(sid, 0)
+    if prior >= cap:
+        logger.warning("[%s] sid=%s exceeded max_turns_per_sid=%d; killing run", log_prefix, sid, cap)
+        return web.json_response(
+            {
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": (f"adapter: sid {sid!r} exceeded max_turns_per_sid={cap}; killing run"),
+                }
+            },
+            status=429,
+        )
+    if increment:
+        counts[sid] = prior + 1
+    return None
+
+
 def manager_finish_reason(tool_uses: list[dict], raw_finish: str) -> str:
     """Finish reason stored on the manager turn: tool_calls if the turn called a
     tool, else the raw sglang finish."""
@@ -292,27 +327,13 @@ class BaseAdapter:
     # -- shared request pipeline ---------------------------------------------
 
     def _check_turn_cap(self, sid: str) -> web.Response | None:
-        """Enforce max_turns_per_sid, returning a 429 response once exceeded.
-
-        Increments the per-sid counter as a side effect when under the cap.
-        """
-        cap = self.max_turns_per_sid
-        if cap is None:
-            return None
-        prior = self._sid_turn_count.get(sid, 0)
-        if prior >= cap:
-            self.logger.warning("[%s] sid=%s exceeded max_turns_per_sid=%d; killing run", self.log_prefix, sid, cap)
-            return web.json_response(
-                {
-                    "error": {
-                        "type": "rate_limit_error",
-                        "message": (f"adapter: sid {sid!r} exceeded max_turns_per_sid={cap}; killing run"),
-                    }
-                },
-                status=429,
-            )
-        self._sid_turn_count[sid] = prior + 1
-        return None
+        return check_turn_cap(
+            self._sid_turn_count,
+            sid,
+            self.max_turns_per_sid,
+            logger=self.logger,
+            log_prefix=self.log_prefix,
+        )
 
     def _run_debug_callback(self, sid, translated, tools_schema, manager_message, turn) -> None:
         """Run the optional debug-only data dump callback; unset in production."""

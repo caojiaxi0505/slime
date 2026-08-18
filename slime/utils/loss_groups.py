@@ -28,6 +28,7 @@ def build_loss_group_fields(
     loss_weights: list[float] = []
     group_rollout_ids: dict[Hashable, Hashable] = {}
     group_weights: dict[Hashable, float] = {}
+    group_kinds: dict[Hashable, str] = {}
     group_mask_sums: dict[Hashable, int] = {}
     explicit_objective = any(
         getattr(sample, "loss_group_id", None) is not None
@@ -37,6 +38,8 @@ def build_loss_group_fields(
     loss_stage_ids: list[int] = []
 
     for sample, rollout_id, loss_mask in zip(samples, rollout_ids, loss_masks, strict=True):
+        metadata = getattr(sample, "metadata", None) or {}
+        kind = str(metadata.get("sample_kind") or "")
         loss_group_id = getattr(sample, "loss_group_id", None)
         if loss_group_id is None:
             loss_group_id = rollout_id
@@ -46,6 +49,11 @@ def build_loss_group_fields(
             raise ValueError(f"loss_group_id must be hashable, got {loss_group_id!r}") from exc
 
         raw_weight = getattr(sample, "loss_weight", None)
+        if kind == "teacher_sft" and raw_weight is None:
+            raise ValueError(
+                "teacher_sft sample is missing explicit loss_weight; "
+                "refusing legacy/un-normalized rollout data"
+            )
         loss_weight = 1.0 if raw_weight is None else float(raw_weight)
         if not math.isfinite(loss_weight) or loss_weight < 0:
             raise ValueError(f"loss_weight must be finite and non-negative, got {loss_weight!r}")
@@ -62,11 +70,21 @@ def build_loss_group_fields(
                 f"loss_group_id {loss_group_id!r} has inconsistent weights "
                 f"{previous_weight!r} and {loss_weight!r}"
             )
+        previous_kind = group_kinds.setdefault(loss_group_id, kind)
+        if previous_kind != kind:
+            raise ValueError(
+                f"loss_group_id {loss_group_id!r} mixes sample kinds "
+                f"{previous_kind!r} and {kind!r}"
+            )
 
         loss_group_ids.append(loss_group_id)
         loss_weights.append(loss_weight)
-        metadata = getattr(sample, "metadata", None) or {}
-        loss_stage_ids.append(1 if metadata.get("sample_kind") == "branch" else 0)
+        if kind == "teacher_sft":
+            loss_stage_ids.append(2)
+        elif kind == "branch":
+            loss_stage_ids.append(1)
+        else:
+            loss_stage_ids.append(0)
         group_mask_sums[loss_group_id] = group_mask_sums.get(loss_group_id, 0) + sum(int(x) for x in loss_mask)
 
     output = {

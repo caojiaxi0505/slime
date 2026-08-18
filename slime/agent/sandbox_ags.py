@@ -28,13 +28,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import logging
 import os
 import random
 import shlex
 import sys
+import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -50,6 +53,9 @@ _DEFAULT_MAX_RETRIES = 5
 _DEFAULT_RETRY_DELAYS_SEC = (15.0, 30.0, 60.0)
 _DEFAULT_RETRY_JITTER_RATIO = 0.1
 _DEFAULT_RETRY_JITTER_MAX_SEC = 5.0
+_START_SEM: asyncio.Semaphore | None = None
+_START_SEM_LIMIT: int | None = None
+_DEFAULT_EXECUTOR_CONFIGURED_LOOPS: set[int] = set()
 
 _REQUIRED_KEYS = (
     "SLIME_AGENT_AGS_SECRET_ID",
@@ -112,6 +118,51 @@ def _require_ags_env() -> dict[str, str]:
 
 def _optional(name: str, default: str) -> str:
     return (os.environ.get(name) or "").strip() or default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _optional(name, str(default))
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, raw, default)
+        return default
+
+
+def _configure_ags_threadpool() -> None:
+    """Optionally bound the default executor used by SWE-ReX ``to_thread`` calls."""
+    workers = _env_int("SLIME_AGENT_AGS_THREADPOOL_WORKERS", 0)
+    if workers <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    if loop_id in _DEFAULT_EXECUTOR_CONFIGURED_LOOPS:
+        return
+    loop.set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="ags-sdk",
+        )
+    )
+    _DEFAULT_EXECUTOR_CONFIGURED_LOOPS.add(loop_id)
+    logger.info("[agent.sandbox_ags] configured default executor max_workers=%d", workers)
+
+
+@asynccontextmanager
+async def _ags_start_slot():
+    """Gate only AGS deployment start, not the lifetime of the sandbox."""
+    global _START_SEM, _START_SEM_LIMIT
+    n = _env_int("SLIME_AGENT_AGS_START_CONCURRENCY", 0)
+    if n <= 0:
+        yield 0.0
+        return
+    if _START_SEM is None or _START_SEM_LIMIT != n:
+        _START_SEM = asyncio.Semaphore(n)
+        _START_SEM_LIMIT = n
+        logger.info("[agent.sandbox_ags] start concurrency limit=%d", n)
+    queued_at = time.time()
+    async with _START_SEM:
+        yield time.time() - queued_at
 
 
 def _retry_count() -> int:
@@ -247,16 +298,27 @@ class AGSSandbox:
         return kwargs
 
     async def __aenter__(self) -> AGSSandbox:
+        _configure_ags_threadpool()
         required = _require_ags_env()
         config_cls, get_deployment, rex_command_cls, rex_command_response_cls = self._import_swerex()
         self._rex_command_cls = rex_command_cls
         self._rex_command_response_cls = rex_command_response_cls
         self._deployment = get_deployment(config_cls(**self._deployment_kwargs(required)))
-        await self._deployment.start()
+        start_at = time.time()
+        async with _ags_start_slot() as queue_wait:
+            await self._deployment.start()
+        start_elapsed = time.time() - start_at
         self.sandbox_id = str(
             getattr(self._deployment, "instance_id", None)
             or getattr(self._deployment, "sandbox_id", None)
             or ""
+        )
+        logger.info(
+            "[agent.sandbox_ags] start complete sandbox_id=%s queue_wait_sec=%.2f elapsed_sec=%.2f image=%s",
+            self.sandbox_id,
+            queue_wait,
+            start_elapsed,
+            self.image,
         )
         return self
 

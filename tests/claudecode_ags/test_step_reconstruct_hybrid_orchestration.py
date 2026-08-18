@@ -38,6 +38,10 @@ from slime.utils.types import Sample
             "resume_subagent",
         ),
         (RuntimeError("token_exact_resume_not_verified"), "resume_other"),
+        (
+            RuntimeError("teacher_context_integrity:token_prefix_mismatch"),
+            "context_integrity",
+        ),
         (RuntimeError("rebuild apply/verify failed"), "workspace_rebuild"),
         (TimeoutError(), "timeout_other"),
         (asyncio.CancelledError(), "cancelled"),
@@ -129,6 +133,15 @@ def test_collect_and_select(tmp_path):
     assert sel[0].source_trial_idx == 1
     assert sel[0].edit_step_i == 1
     assert sel[0].branch_step_t == 0
+
+
+def test_collect_candidates_without_patch_only_keeps_read_turns(tmp_path):
+    # Step 0 is a read (diff unchanged); teacher relabeling can resume it too.
+    b0 = _bundle(tmp_path / "t0", ["", "diff --git a/a b/a\n+1\n"])
+    trials = [VanillaTrialResult(0, b0, [_sample()], False, [[-1.0], [-2.0, -2.0]])]
+    assert [c.edit_step_i for c in collect_patch_candidates(trials)] == [1]
+    all_turns = collect_patch_candidates(trials, patch_only=False)
+    assert [(c.edit_step_i, c.branch_step_t) for c in all_turns] == [(0, -1), (1, 0)]
 
 
 def test_checkpoint_group_sets_pre_turn_without_transcript_order():
@@ -444,6 +457,52 @@ def test_hybrid_cancelled_branch_is_dropped(tmp_path):
     assert len(branches) == 3
     assert all(s.metadata["hybrid_num_dropped_branches"] == 1 for s in out)
     assert all(s.metadata["hybrid_num_dropped_cancelled"] == 1 for s in out)
+
+
+def test_hybrid_stage2_fn_replaces_selection_and_branching(tmp_path):
+    os.environ["STEP_GRPO_HYBRID_K"] = "2"
+    b0 = _bundle(tmp_path / "a", ["", "diff --git a/a b/a\n+1\n"])
+    b1 = _bundle(tmp_path / "b", ["", "diff --git a/a b/a\n+2\n"])
+
+    async def vanilla_runner(**kwargs):
+        i = kwargs["trial_idx"]
+        bundle = b0 if i == 0 else b1
+        s = _sample(0.0, index=i)
+        s.metadata = {"sample_kind": "vanilla", "trial_idx": i}
+        return bundle, [s], False, [[], [-1.0]]
+
+    async def branch_runner(**kwargs):
+        raise AssertionError("stage2_fn must replace branching")
+
+    seen = {}
+
+    async def stage2_fn(**kwargs):
+        seen.update(kwargs)
+        s = _sample(0.0, index=99)
+        s.metadata = {"sample_kind": "teacher_sft", "branch_uid": "tt:0:t0:c0"}
+        s.loss_mask = [1]
+        return [s]
+
+    out = asyncio.run(
+        hybrid_generate(
+            SimpleNamespace(),
+            _sample(),
+            {},
+            vanilla_runner=vanilla_runner,
+            branch_runner=branch_runner,
+            stage2_fn=stage2_fn,
+        )
+    )
+
+    assert [t.trial_idx for t in seen["trials"]] == [0, 1]
+    assert seen["sampling_params"] == {}
+    assert "hybrid_stage2_context_limit_tokens" in seen["hybrid_stats"]
+    kinds = [s.metadata["sample_kind"] for s in out]
+    assert kinds.count("vanilla") == 2
+    assert kinds.count("teacher_sft") == 1
+    assert len({s.rollout_id for s in out}) == 1
+    assert len({s.loss_group_id for s in out}) == 3
+    assert all(s.metadata["hybrid_stage2_wall_sec"] >= 0.0 for s in out)
 
 
 def test_hybrid_step_turn_mismatch_raises():

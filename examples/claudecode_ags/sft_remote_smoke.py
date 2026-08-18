@@ -219,6 +219,7 @@ def _build_adapter(
         top_p=float(os.environ.get("SLIME_REMOTE_OPENAI_TOP_P") or "0.95"),
         top_k=int(os.environ.get("SLIME_REMOTE_OPENAI_TOP_K") or "20"),
         reasoning_effort=os.environ.get("SLIME_REMOTE_OPENAI_REASONING_EFFORT") or "max",
+        thinking_type=os.environ.get("SLIME_REMOTE_OPENAI_THINKING_TYPE"),
     )
     handle = run_app_in_thread(
         adapter.app,

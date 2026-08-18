@@ -415,6 +415,14 @@ async def generate_rollout_async(
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             group: list[Sample] = task.result()
+            # Custom generate may return a list[Sample] fan-out. Generic empty
+            # outputs are resampled. Fixed-task SFT must return a zero-mask
+            # placeholder instead, so an empty task cannot shrink its barrier.
+            first = group[0] if group else None
+            if first is None or (isinstance(first, list) and not first):
+                logger.warning("Empty generate group; dropping prompt and resampling")
+                state.remaining_batch_size -= 1
+                continue
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]

@@ -60,6 +60,10 @@ def _is_vanilla(sample: Sample) -> bool:
     return bool((sample.metadata or {}).get("sample_kind") == "vanilla")
 
 
+def _is_teacher_sft(sample: Sample) -> bool:
+    return bool((sample.metadata or {}).get("sample_kind") == "teacher_sft")
+
+
 def _vanilla_group_key(sample: Sample) -> Any:
     gi = sample.group_index if sample.group_index is not None else sample.index
     return f"v:{gi}"
@@ -144,7 +148,12 @@ def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
     for s in flat:
         if s.loss_group_id is None:
             s.loss_group_id = _default_loss_group_id(s)
-        kind = "vanilla" if _is_vanilla(s) else "branch"
+        if _is_vanilla(s):
+            kind = "vanilla"
+        elif _is_teacher_sft(s):
+            kind = "teacher_sft"
+        else:
+            kind = "branch"
         episode_members[(_outer_loss_key(s), kind, _branch_key(s))].append(s)
         s.loss_weight = 0.0
         s.metadata = s.metadata or {}
@@ -161,6 +170,7 @@ def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
                 raise ValueError(f"loss_group_id {s.loss_group_id!r} is shared by episodes {owner!r} and {key!r}")
 
     vanilla_by_outer: dict[Any, set[tuple[Any, str, Any]]] = defaultdict(set)
+    teacher_by_outer: dict[Any, set[tuple[Any, str, Any]]] = defaultdict(set)
     branch_by_outer_group: dict[Any, dict[Any, set[tuple[Any, str, Any]]]] = defaultdict(
         lambda: defaultdict(set)
     )
@@ -170,8 +180,12 @@ def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
         if _is_vanilla(sample):
             vanilla_by_outer[outer].add(key)
             continue
-        if active_episode[key]:
-            branch_by_outer_group[outer][_step_group_key(sample)].add(key)
+        if not active_episode[key]:
+            continue
+        if _is_teacher_sft(sample):
+            teacher_by_outer[outer].add(key)
+            continue
+        branch_by_outer_group[outer][_step_group_key(sample)].add(key)
 
     def _set_episode_weight(key: tuple[Any, str, Any], weight: float) -> None:
         expected_ids = {s.loss_group_id for s in episode_members[key]}
@@ -214,10 +228,28 @@ def _assign_loss_weights(flat: list[Sample]) -> tuple[int, int, int]:
             for key in keys:
                 _set_episode_weight(key, weight)
 
+    # Teacher SFT rows are one turn each, so a long trial would otherwise
+    # contribute proportionally more gradient than a short one. Equal-split to 1
+    # per outer prompt; the SFT/GRPO trade-off coefficient stays in the custom
+    # loss (STEP_GRPO_TEACHER_SFT_LOSS_WEIGHT) so it is applied exactly once.
+    active_teacher_episodes = 0
+    for keys in teacher_by_outer.values():
+        if not keys:
+            continue
+        active_teacher_episodes += len(keys)
+        weight = 1.0 / len(keys)
+        for key in keys:
+            _set_episode_weight(key, weight)
+
     active_vanilla_episodes = sum(
         int(active_episode[key]) for keys in vanilla_by_outer.values() for key in keys
     )
-    return active_vanilla_episodes, active_branch_groups, active_branch_episodes
+    return (
+        active_vanilla_episodes,
+        active_branch_groups,
+        active_branch_episodes,
+        active_teacher_episodes,
+    )
 
 
 def _normalize_positions(
@@ -285,7 +317,8 @@ def post_process_rewards(
     use_std = _env_bool("STEP_GRPO_STD_NORMALIZATION", True) and estimator in ("grpo", "gspo")
 
     vanilla_idx = [i for i, s in enumerate(flat) if _is_vanilla(s)]
-    branch_idx = [i for i in range(len(flat)) if i not in set(vanilla_idx)]
+    teacher_idx = {i for i, s in enumerate(flat) if _is_teacher_sft(s)}
+    branch_idx = [i for i in range(len(flat)) if i not in set(vanilla_idx) and i not in teacher_idx]
 
     adv: dict[int, float] = {}
     n_vg = n_bg = 0
@@ -304,14 +337,16 @@ def post_process_rewards(
     if branch_idx:
         adv.update(_normalize_positions(flat, branch_idx, args, use_std, _step_group_key))
         n_bg = len({_step_group_key(flat[i]) for i in branch_idx})
+    # teacher_sft rows keep advantage 0; custom_loss trains them with SFT NLL.
 
     advantages = [adv.get(i, 0.0) for i in range(len(flat))]
     logger.info(
-        "[step_grpo_adv] rows=%d vanilla=%d branch=%d vanilla_groups=%d step_groups=%d "
-        "estimator=%s use_std=%s",
+        "[step_grpo_adv] rows=%d vanilla=%d branch=%d teacher_sft=%d "
+        "vanilla_groups=%d step_groups=%d estimator=%s use_std=%s",
         len(flat),
         len(vanilla_idx),
         len(branch_idx),
+        len(teacher_idx),
         n_vg,
         n_bg,
         estimator,
@@ -332,7 +367,7 @@ def filter(args: Any, data: list[Any]) -> None:
         return
 
     vanilla = [s for s in flat if _is_vanilla(s)]
-    branch = [s for s in flat if not _is_vanilla(s)]
+    branch = [s for s in flat if not _is_vanilla(s) and not _is_teacher_sft(s)]
 
     def _inspect_groups(
         members: list[Sample],
@@ -394,11 +429,12 @@ def filter(args: Any, data: list[Any]) -> None:
         bg = len({_step_group_key(s) for s in branch})
         vs = vm = bs = bm = 0
 
-    active_v, active_bg, active_b = _assign_loss_weights(flat)
+    active_v, active_bg, active_b, active_t = _assign_loss_weights(flat)
     logger.info(
         "[step_grpo_adv] filter: vanilla_groups=%d (std0=%d mask0=%d audit_only) "
         "branch_groups=%d (std0=%d mask0=%d) active_vanilla_episodes=%d "
-        "active_branch_groups=%d active_branch_episodes=%d branch_lambda=%.6g",
+        "active_branch_groups=%d active_branch_episodes=%d "
+        "active_teacher_sft_rows=%d branch_lambda=%.6g",
         vg,
         vs,
         vm,
@@ -408,5 +444,6 @@ def filter(args: Any, data: list[Any]) -> None:
         active_v,
         active_bg,
         active_b,
+        active_t,
         _env_float("STEP_GRPO_BRANCH_LOSS_WEIGHT", 1.0),
     )

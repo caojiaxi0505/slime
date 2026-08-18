@@ -95,8 +95,11 @@ def _episode_samples(samples: list) -> list:
 
 
 def _split_stage_episodes(samples: list) -> tuple[list, list]:
-    """Stage-1 (vanilla / unlabeled) vs Stage-2 (branch) episode reps."""
-    eps = _episode_samples(samples)
+    """Stage-1 (vanilla / unlabeled) vs Stage-2 (branch) episode reps.
+
+    Teacher SFT rows belong to neither: they have no reward and no eval.
+    """
+    eps = [s for s in _episode_samples(samples) if not _is_teacher_sft(s)]
     stage1 = [s for s in eps if _sample_kind(s) != "branch"]
     stage2 = [s for s in eps if _sample_kind(s) == "branch"]
     return stage1, stage2
@@ -323,7 +326,173 @@ def _tool_loop_metrics(samples: list) -> dict[str, float]:
 def _filter_kind(samples: list, kind: str) -> list:
     if kind == "branch":
         return [s for s in samples if _sample_kind(s) == "branch"]
-    return [s for s in samples if _sample_kind(s) != "branch"]
+    return [s for s in samples if _sample_kind(s) != "branch" and not _is_teacher_sft(s)]
+
+
+def _is_teacher_sft(sample) -> bool:
+    return str(_meta(sample).get("sample_kind") or "").strip().lower() == "teacher_sft"
+
+
+def _teacher_outer_key(sample) -> tuple[str, Any]:
+    """Stable identity of the raw SWE task that owns a teacher row."""
+    for name in ("rollout_id", "group_index", "index"):
+        value = getattr(sample, name, None)
+        if value is not None:
+            return name, value
+    return "object", id(sample)
+
+
+def _percentile(values: list[float], q: float) -> float:
+    """Small dependency-free linear percentile helper (``q`` in ``[0, 1]``)."""
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    position = (len(ordered) - 1) * q
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def _teacher_sft_metrics(rows: list) -> dict[str, float]:
+    """Audit the fixed raw-task barrier and variable teacher-target batch.
+
+    Teacher-only mode removes the Stage-1 samples before logging.  Their
+    aggregate counters are copied onto every returned teacher row (including
+    one zero-mask placeholder for a task with no target), so this function can
+    recover the exact Stage-1 denominator without treating teacher targets as
+    reward-bearing episodes.
+    """
+    if not rows:
+        return {}
+
+    rows_by_outer: dict[tuple[str, Any], list] = defaultdict(list)
+    for row in rows:
+        rows_by_outer[_teacher_outer_key(row)].append(row)
+
+    def group_key(row) -> Any:
+        md = _meta(row)
+        return (
+            getattr(row, "loss_group_id", None)
+            or md.get("branch_uid")
+            or ("sample", getattr(row, "index", None), id(row))
+        )
+
+    active_groups_by_outer: dict[tuple[str, Any], set[Any]] = defaultdict(set)
+    active_rows = []
+    placeholders = []
+    for outer, outer_rows in rows_by_outer.items():
+        for row in outer_rows:
+            md = _meta(row)
+            loss_mask = getattr(row, "loss_mask", None)
+            trainable_tokens = (
+                sum(int(value) for value in loss_mask)
+                if loss_mask is not None
+                else _md_int(row, "teacher_trainable_tokens")
+            )
+            is_placeholder = bool(md.get("teacher_sft_placeholder"))
+            is_active = (
+                not is_placeholder
+                and not bool(getattr(row, "remove_sample", False))
+                and not bool(getattr(row, "is_filtered_out", False))
+                and trainable_tokens > 0
+            )
+            if is_active:
+                active_rows.append(row)
+                active_groups_by_outer[outer].add(group_key(row))
+            if is_placeholder:
+                placeholders.append(row)
+
+    relabels_per_prompt = [
+        float(len(active_groups_by_outer.get(outer, set()))) for outer in rows_by_outer
+    ]
+    active_outers = {outer for outer, groups in active_groups_by_outer.items() if groups}
+    trainable = [float(_md_int(row, "teacher_trainable_tokens")) for row in active_rows]
+    prefix = [float(_md_int(row, "teacher_prefix_tokens")) for row in active_rows]
+
+    out = {
+        # ``samples`` is semantic relabel episodes; ``rows`` also exposes any
+        # future compact-segment fan-out.
+        "perf/step_grpo/n_teacher_sft_samples": float(sum(len(v) for v in active_groups_by_outer.values())),
+        "perf/step_grpo/n_teacher_sft_rows": float(len(rows)),
+        "perf/step_grpo/n_teacher_sft_placeholders": float(len(placeholders)),
+        "perf/step_grpo/n_teacher_sft_scheduled_prompts": float(len(rows_by_outer)),
+        "perf/step_grpo/n_teacher_sft_active_prompts": float(len(active_outers)),
+        "perf/step_grpo/teacher_sft_active_prompt_rate": float(len(active_outers)) / float(len(rows_by_outer)),
+        "perf/step_grpo/teacher_sft_relabels_per_prompt/mean": float(sum(relabels_per_prompt))
+        / float(len(relabels_per_prompt)),
+        "perf/step_grpo/teacher_sft_relabels_per_prompt/p50": _percentile(relabels_per_prompt, 0.50),
+        "perf/step_grpo/teacher_sft_relabels_per_prompt/p90": _percentile(relabels_per_prompt, 0.90),
+        "perf/step_grpo/teacher_sft_relabels_per_prompt/min": float(min(relabels_per_prompt)),
+        "perf/step_grpo/teacher_sft_relabels_per_prompt/max": float(max(relabels_per_prompt)),
+        "perf/step_grpo/teacher_sft_unset_loss_weight_count": float(
+            sum(getattr(row, "loss_weight", None) is None for row in rows)
+        ),
+        "perf/step_grpo/teacher_sft_trainable_tokens_sum": float(sum(trainable)),
+        "perf/step_grpo/teacher_sft_trainable_tokens_mean": (
+            float(sum(trainable) / len(trainable)) if trainable else 0.0
+        ),
+        "perf/step_grpo/teacher_sft_prefix_tokens_mean": (
+            float(sum(prefix) / len(prefix)) if prefix else 0.0
+        ),
+    }
+
+    # Count each loss group once: compact segments repeat one coefficient.
+    group_weights_by_outer: dict[tuple[str, Any], dict[Any, float]] = defaultdict(dict)
+    for outer, outer_rows in rows_by_outer.items():
+        for row in outer_rows:
+            weight = _safe_float(getattr(row, "loss_weight", None))
+            if weight is None:
+                continue
+            key = group_key(row)
+            previous = group_weights_by_outer[outer].setdefault(key, weight)
+            if previous != weight:
+                logger.warning("teacher loss group %r has inconsistent W&B weights", key)
+    outer_weight_sums = {
+        outer: float(sum(weights.values())) for outer, weights in group_weights_by_outer.items()
+    }
+    out["perf/step_grpo/teacher_sft_loss_weight_sum"] = float(sum(outer_weight_sums.values()))
+    active_outer_weights = [outer_weight_sums.get(outer, 0.0) for outer in active_outers]
+    if active_outer_weights:
+        out["perf/step_grpo/teacher_sft_active_prompt_loss_weight/mean"] = float(
+            sum(active_outer_weights) / len(active_outer_weights)
+        )
+        out["perf/step_grpo/teacher_sft_active_prompt_loss_weight/min"] = float(
+            min(active_outer_weights)
+        )
+        out["perf/step_grpo/teacher_sft_active_prompt_loss_weight/max"] = float(
+            max(active_outer_weights)
+        )
+
+    # One representative per raw task; values are repeated on every relabel.
+    prompt_reps = [outer_rows[0] for outer_rows in rows_by_outer.values()]
+    stage1_totals: dict[str, float] = {}
+    for metadata_key, leaf in (
+        ("hybrid_num_stage1_planned_trials", "planned"),
+        ("hybrid_num_stage1_completed_trials", "completed"),
+        ("hybrid_num_stage1_resolved_trials", "resolved"),
+        ("hybrid_num_stage1_unresolved_trials", "unresolved"),
+        ("hybrid_num_stage1_aborted_placeholders", "aborted"),
+    ):
+        values = [_safe_float(_meta(row).get(metadata_key)) for row in prompt_reps]
+        known = [value for value in values if value is not None]
+        if known:
+            stage1_totals[leaf] = float(sum(known))
+            out[f"perf/step_grpo/n_stage1_{leaf}_trials"] = stage1_totals[leaf]
+
+    planned = stage1_totals.get("planned")
+    resolved = stage1_totals.get("resolved")
+    completed = stage1_totals.get("completed")
+    if planned is not None and planned > 0 and resolved is not None:
+        # The denominator is the fixed 16*K scheduled slots. Infra failures
+        # therefore remain visible instead of making the curve look better.
+        out["outcome/n_episodes"] = planned
+        out["outcome/resolved_count"] = resolved
+        out["outcome/resolved_rate"] = resolved / planned
+    if planned is not None and planned > 0 and completed is not None:
+        out["perf/step_grpo/stage1_completion_rate"] = completed / planned
+        out["perf/step_grpo/n_stage1_incomplete_trials"] = max(planned - completed, 0.0)
+    return out
 
 
 def _has_hybrid(samples: list) -> bool:
@@ -613,6 +782,7 @@ def _hybrid_objective_metrics(samples: list) -> dict[str, float]:
         ("hybrid_num_dropped_resume_subagent", "n_dropped_resume_subagent"),
         ("hybrid_num_dropped_resume_other", "n_dropped_resume_other"),
         ("hybrid_num_dropped_workspace_rebuild", "n_dropped_workspace_rebuild"),
+        ("hybrid_num_dropped_context_integrity", "n_dropped_context_integrity"),
         ("hybrid_num_dropped_other", "n_dropped_other"),
     ):
         values = [_safe_float(_meta(s).get(metadata_key)) for s in prompt_reps.values()]
@@ -892,6 +1062,17 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
     from slime.utils.metric_utils import compute_rollout_step, dict_add_prefix
 
     log_dict = dict(rollout_extra_metrics or {})
+    # Teacher SFT rows have reward 0 and no eval details, and _sample_kind would
+    # otherwise fold them into the Stage-1 (vanilla) curves.
+    log_dict.update(_teacher_sft_metrics([s for s in samples if _is_teacher_sft(s)]))
+    samples = [s for s in samples if not _is_teacher_sft(s)]
+    if not samples:
+        step = compute_rollout_step(args, rollout_id)
+        log_dict["rollout/step"] = step
+        logger.info("perf %s (teacher sft only): %s", rollout_id, log_dict)
+        logging_utils.log(args, log_dict, step_key="rollout/step")
+        return True
+
     stage1 = _filter_kind(samples, "vanilla")
     stage2 = _filter_kind(samples, "branch")
     # Top-level rollout/perf sample stats = Stage-1 only (comparable to naive GRPO).
